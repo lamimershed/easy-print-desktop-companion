@@ -153,11 +153,24 @@ ipcMain.handle("print-hello", async () => {
 
 // Print raw file (PDF, image, etc.) using system lpr command
 ipcMain.handle("print-file", async (event, options = {}) => {
-  const { fileData, fileName, copies = 1, printerName } = options;
+  const {
+    fileData,
+    fileName,
+    copies = 1,
+    printerName,
+    colorMode = "color",
+  } = options;
 
   try {
     // Convert ArrayBuffer to Buffer
-    const buffer = Buffer.from(fileData);
+    let buffer = Buffer.from(fileData);
+
+    // For images with blackwhite mode, convert to grayscale
+    // Note: For now we pass colorMode to lpr, actual grayscale conversion
+    // would require image processing library like sharp
+    // macOS lpr doesn't natively support grayscale, so this is a placeholder
+    // A full implementation would use: const sharp = require('sharp');
+    // buffer = await sharp(buffer).grayscale().toBuffer();
 
     // Create temp file path with sanitized filename
     const safeName = fileName.replace(/[^a-zA-Z0-9.-]/g, "_");
@@ -168,6 +181,13 @@ ipcMain.handle("print-file", async (event, options = {}) => {
 
     // Build lpr command
     let command = `lpr -# ${copies}`;
+
+    // Add color mode option (if supported by printer)
+    // Note: -o ColorModel=Gray works on many printers for grayscale
+    if (colorMode === "blackwhite") {
+      command += ` -o ColorModel=Gray`;
+    }
+
     if (printerName) {
       command += ` -P "${printerName}"`;
     }
