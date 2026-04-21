@@ -234,6 +234,10 @@ ipcMain.handle("print-file", async (event, options = {}) => {
  * Falls back gracefully with cupsError set if CUPS is unavailable.
  */
 ipcMain.handle("get-device-info", async () => {
+  if (!mainWindow) {
+    return { printer: null, supplyLevels: [], cupsError: "Window not ready" };
+  }
+
   const printers = await mainWindow.webContents.getPrintersAsync();
   const defaultPrinter =
     printers.find((p) => p.isDefault) || printers[0] || null;
