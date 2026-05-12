@@ -180,18 +180,36 @@ async function getPrinterRealStatus(printer) {
 
 // ── IPC: get-device-info ──────────────────────────────────────────────────────
 
+async function detectDuplexSupport(printerName) {
+  try {
+    const pFlag = printerName ? `-p "${printerName}"` : "";
+    const { stdout } = await execAsync(`lpoptions ${pFlag} -l 2>/dev/null`);
+    for (const line of stdout.split("\n")) {
+      // Match the `sides` or `Duplex` PPD option line
+      const m = line.match(/^(sides|Duplex)\/[^:]*:\s*(.+)$/i);
+      if (!m) continue;
+      const values = m[2];
+      return values.includes("two-sided") || values.includes("DuplexNoTumble") || values.includes("DuplexTumble");
+    }
+  } catch { /* lpoptions unavailable */ }
+  return false;
+}
+
 ipcMain.handle("get-device-info", async () => {
-  if (!mainWindow) return { printer: null, supplyLevels: [], cupsError: null };
+  if (!mainWindow) return { printer: null, supplyLevels: [], cupsError: null, supportsDuplex: false };
 
   const printers = await mainWindow.webContents.getPrintersAsync();
   const defaultPrinter = printers.find((p) => p.isDefault) || printers[0] || null;
 
-  if (!defaultPrinter) return { printer: null, supplyLevels: [], cupsError: null };
+  if (!defaultPrinter) return { printer: null, supplyLevels: [], cupsError: null, supportsDuplex: false };
 
-  const realStatus = await getPrinterRealStatus(defaultPrinter);
-  const supplyLevels = parseSupplyLevels(defaultPrinter);
+  const [realStatus, supplyLevels, supportsDuplex] = await Promise.all([
+    getPrinterRealStatus(defaultPrinter),
+    Promise.resolve(parseSupplyLevels(defaultPrinter)),
+    detectDuplexSupport(defaultPrinter.name),
+  ]);
 
-  return { printer: { ...defaultPrinter, realStatus }, supplyLevels, cupsError: null };
+  return { printer: { ...defaultPrinter, realStatus }, supplyLevels, cupsError: null, supportsDuplex };
 });
 
 // ── IPC: print (HTML) ─────────────────────────────────────────────────────────
