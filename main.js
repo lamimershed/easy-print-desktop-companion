@@ -1,4 +1,4 @@
-require("dotenv").config();
+require("dotenv").config({ path: require("path").join(__dirname, ".env") });
 const { app, BrowserWindow, ipcMain } = require("electron");
 const path = require("path");
 const { writeFile, unlink } = require("fs/promises");
@@ -10,7 +10,7 @@ const execFileAsync = promisify(execFile);
 
 const execAsync = promisify(exec);
 
-const WEB_APP_URL = process.env.WEB_APP_URL || "http://localhost:5174";
+const WEB_APP_URL = process.env.WEB_APP_URL || "https://client.printeasy.themangatech.com";
 
 let mainWindow;
 
@@ -25,7 +25,18 @@ function createWindow() {
     },
   });
 
+  console.log("[Companion] Loading URL:", WEB_APP_URL);
   mainWindow.loadURL(WEB_APP_URL);
+
+  mainWindow.webContents.on("did-fail-load", (event, errorCode, errorDesc, validatedURL) => {
+    console.error("[Companion] Failed to load:", validatedURL, errorCode, errorDesc);
+    mainWindow.loadURL(`data:text/html,<html><body style="font-family:sans-serif;padding:40px;background:#1a4d30;color:white;">
+      <h2>Could not load app</h2>
+      <p>URL: ${WEB_APP_URL}</p>
+      <p>Error: ${errorDesc} (${errorCode})</p>
+      <button onclick="location.reload()" style="margin-top:16px;padding:10px 20px;background:#3aad6a;color:white;border:none;border-radius:6px;font-size:16px;cursor:pointer;">Retry</button>
+    </body></html>`);
+  });
 
   mainWindow.webContents.on("did-finish-load", () => {
     mainWindow.webContents.executeJavaScript(`
@@ -39,7 +50,7 @@ function createWindow() {
     `);
   });
 
-  mainWindow.webContents.openDevTools();
+  if (!app.isPackaged) mainWindow.webContents.openDevTools();
 }
 
 // ── Printer status polling ────────────────────────────────────────────────────
@@ -125,7 +136,7 @@ function parseSupplyLevels(printer) {
 // ── Cross-platform printer status ─────────────────────────────────────────────
 
 // Electron's printer.status codes: 0=Idle, 1=Processing, 2=Paused, 3=Stopped, 4=Error
-const ELECTRON_STATUS_MAP = { 0: "ready", 1: "printing", 2: "queue_stopped", 3: "disconnected", 4: "unknown" };
+const ELECTRON_STATUS_MAP = { 0: "ready", 1: "printing", 2: "queue_stopped", 3: "queue_stopped", 4: "unknown" };
 
 async function getMacPrinterStatus(printer) {
   const deviceUri = printer.options?.["device-uri"] ?? "";
@@ -242,6 +253,7 @@ ipcMain.handle("print", async (event, options = {}) => {
 
     printWindow.webContents.print(printOptions, (success, errorType) => {
       printWindow.close();
+      if (mainWindow) mainWindow.webContents.send("print-stage", success ? "complete" : "error");
       resolve(success
         ? { success: true, stage: "complete" }
         : { success: false, stage: "error", error: errorType }
@@ -274,13 +286,14 @@ ipcMain.handle("print-file", async (event, options = {}) => {
     fileData,
     fileName,
     copies = 1,
+    paperSize = "A4",
     printerName,
     colorMode = "color",
     duplex = "simplex",
     pageRange,
   } = options;
 
-  console.log("[Companion] print-file:", { fileName, copies, colorMode, duplex, pageRange });
+  console.log("[Companion] print-file:", { fileName, copies, colorMode, duplex, pageRange, paperSize });
 
   const buffer = Buffer.from(fileData);
   const safeName = fileName.replace(/[^a-zA-Z0-9.-]/g, "_");
@@ -306,6 +319,8 @@ ipcMain.handle("print-file", async (event, options = {}) => {
     lprArgs.push("-o", isGrayscale ? "print-color-mode=monochrome" : "print-color-mode=color");
 
     // Duplex — IPP standard `sides` option
+    // The customer was charged for this size, so print on it.
+    if (paperSize) lprArgs.push("-o", `media=${paperSize}`);
     if (duplex === "longEdge") lprArgs.push("-o", "sides=two-sided-long-edge");
     else if (duplex === "shortEdge") lprArgs.push("-o", "sides=two-sided-short-edge");
     else lprArgs.push("-o", "sides=one-sided");
@@ -318,9 +333,11 @@ ipcMain.handle("print-file", async (event, options = {}) => {
 
     await execFileAsync("lpr", lprArgs);
     console.log("[Companion] print-file: lpr succeeded");
+    if (mainWindow) mainWindow.webContents.send("print-stage", "complete");
     return { success: true, stage: "complete" };
   } catch (error) {
     console.error("[Companion] print-file error:", error);
+    if (mainWindow) mainWindow.webContents.send("print-stage", "error");
     return { success: false, stage: "error", error: error.message };
   } finally {
     // Always restore color default and clean up the temp file
@@ -363,10 +380,10 @@ function parsePageRangesNative(rangeStr) {
 ipcMain.handle("print-file-native", async (event, options = {}) => {
   const {
     fileData, fileName, copies = 1, printerName,
-    colorMode = "color", duplex = "simplex", pageRange,
+    colorMode = "color", duplex = "simplex", pageRange, paperSize = "A4",
   } = options;
 
-  console.log("[Companion] print-file-native:", { fileName, copies, colorMode, duplex, pageRange });
+  console.log("[Companion] print-file-native:", { fileName, copies, colorMode, duplex, pageRange, paperSize });
 
   const buffer   = Buffer.from(fileData);
   const safeName = fileName.replace(/[^a-zA-Z0-9.-]/g, "_");
@@ -394,6 +411,7 @@ ipcMain.handle("print-file-native", async (event, options = {}) => {
       silent: true,
       printBackground: false,
       color: colorMode !== "blackwhite",
+      pageSize: paperSize,
       copies,
       duplexMode:
         duplex === "longEdge"  ? "longEdge"  :
@@ -415,6 +433,7 @@ ipcMain.handle("print-file-native", async (event, options = {}) => {
         printWindow.close();
         setTimeout(() => unlink(tempPath).catch(() => {}), 5000);
         console.log("[Companion] print-file-native result:", success, errorType);
+        if (mainWindow) mainWindow.webContents.send("print-stage", success ? "complete" : "error");
         resolve(success
           ? { success: true,  stage: "complete" }
           : { success: false, stage: "error", error: errorType }
