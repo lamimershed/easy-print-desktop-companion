@@ -1,6 +1,7 @@
 require("dotenv").config({ path: require("path").join(__dirname, ".env") });
 const { app, BrowserWindow, ipcMain } = require("electron");
 const path = require("path");
+const { existsSync } = require("fs");
 const { writeFile, unlink } = require("fs/promises");
 const { exec, execFile } = require("child_process");
 const { promisify } = require("util");
@@ -9,6 +10,8 @@ const { tmpdir } = require("os");
 const execFileAsync = promisify(execFile);
 
 const execAsync = promisify(exec);
+
+const IS_WINDOWS = process.platform === "win32";
 
 const WEB_APP_URL = process.env.WEB_APP_URL || "https://client.printeasy.themangatech.com";
 
@@ -103,11 +106,57 @@ ipcMain.handle("get-printers", async () => {
   return mainWindow.webContents.getPrintersAsync();
 });
 
-// ── Supply levels from printer.options ───────────────────────────────────────
-// Electron's getPrintersAsync() already includes marker-* attributes from the
-// printer driver — no CUPS HTTP request needed.
+// ── Windows shell helpers ─────────────────────────────────────────────────────
+// Every Windows probe goes through PowerShell. execFile (not exec) so the script
+// is a single argv entry — no cmd.exe quoting to get wrong.
 
-function parseSupplyLevels(printer) {
+function escapePs(value) {
+  // Escape for a PowerShell single-quoted string literal
+  return String(value).replace(/'/g, "''");
+}
+
+async function runPowerShell(script) {
+  const { stdout } = await execFileAsync(
+    "powershell",
+    ["-NoProfile", "-NonInteractive", "-Command", script],
+    { windowsHide: true }
+  );
+  return stdout.trim();
+}
+
+async function getWindowsPrinterPort(printerName) {
+  if (!printerName) return null;
+  try {
+    const port = await runPowerShell(
+      `Get-Printer -Name '${escapePs(printerName)}' | Select-Object -ExpandProperty PortName`
+    );
+    return port || null;
+  } catch {
+    return null;
+  }
+}
+
+// Local ports carry no network address — SNMP is not reachable through them.
+const LOCAL_PORT_RE = /^(USB|DOT4|LPT|COM|FILE|nul|PORTPROMPT|Microsoft)/i;
+
+async function getWindowsPrinterHostAddress(printerName) {
+  const port = await getWindowsPrinterPort(printerName);
+  if (!port || LOCAL_PORT_RE.test(port)) return null;
+  try {
+    const addr = await runPowerShell(
+      `Get-PrinterPort -Name '${escapePs(port)}' | Select-Object -ExpandProperty PrinterHostAddress`
+    );
+    return addr || null;
+  } catch {
+    return null;
+  }
+}
+
+// ── Supply levels ─────────────────────────────────────────────────────────────
+
+// macOS: Electron's getPrintersAsync() already includes marker-* attributes from
+// the CUPS driver — no CUPS HTTP request needed.
+function parseSupplyLevelsMac(printer) {
   const opts = printer.options || {};
   const namesStr = opts["marker-names"] || "";
   const levelsStr = opts["marker-levels"] || "";
@@ -133,6 +182,144 @@ function parseSupplyLevels(printer) {
   });
 }
 
+// Windows has no universal ink-level API. For network printers the standard
+// Printer-MIB (RFC 3805) over SNMP is the only portable source; USB printers
+// expose nothing, so we report an empty list rather than invent numbers.
+const SNMP_OID = {
+  supplyType: "1.3.6.1.2.1.43.11.1.1.5",
+  supplyDesc: "1.3.6.1.2.1.43.11.1.1.6",
+  supplyMax: "1.3.6.1.2.1.43.11.1.1.8",
+  supplyLevel: "1.3.6.1.2.1.43.11.1.1.9",
+  inputMax: "1.3.6.1.2.1.43.8.2.1.9",
+  inputLevel: "1.3.6.1.2.1.43.8.2.1.10",
+};
+
+// prtMarkerSuppliesType: 3=toner 5=ink 6=inkCartridge 7=inkRibbon
+const SNMP_INK_TYPES = new Set([3, 5, 6, 7]);
+
+// Ceiling for the whole SNMP probe, above net-snmp's own 2s per-request timeout.
+const SNMP_TOTAL_TIMEOUT_MS = 4000;
+
+let _snmp;
+function loadSnmp() {
+  if (_snmp === undefined) {
+    try {
+      _snmp = require("net-snmp");
+    } catch {
+      _snmp = null;
+    }
+  }
+  return _snmp;
+}
+
+// prtMarkerSuppliesLevel sentinels: -1 unknown, -2 unrestricted, -3 some remaining.
+// None of them is a percentage, so surface null instead of a fabricated number.
+function toPercent(level, max) {
+  if (typeof level !== "number" || typeof max !== "number") return null;
+  if (level < 0 || max <= 0) return null;
+  return Math.max(0, Math.min(100, Math.round((level / max) * 100)));
+}
+
+// net-snmp's done-callback is not guaranteed to fire (a wedged socket leaves it
+// pending). Without a hard ceiling a stuck walk would block get-device-info
+// forever and pin the dashboard in its loading state.
+function withTimeout(promise, ms, fallback) {
+  return Promise.race([
+    promise,
+    new Promise((resolve) => setTimeout(() => resolve(fallback), ms)),
+  ]);
+}
+
+function snmpWalk(session, oid) {
+  return new Promise((resolve) => {
+    const byIndex = new Map();
+    session.subtree(
+      oid,
+      20,
+      (varbinds) => {
+        for (const vb of varbinds) {
+          if (!vb || vb.oid == null) continue;
+          const index = vb.oid.slice(oid.length + 1);
+          const value = Buffer.isBuffer(vb.value) ? vb.value.toString("utf8") : vb.value;
+          byIndex.set(index, value);
+        }
+      },
+      () => resolve(byIndex)
+    );
+  });
+}
+
+async function getSupplyLevelsWindows(printer) {
+  const snmp = loadSnmp();
+  if (!snmp) {
+    return { levels: [], error: "SNMP module unavailable — supply levels cannot be read." };
+  }
+
+  const host = await getWindowsPrinterHostAddress(printer.name);
+  if (!host) {
+    // USB/local printer — Windows exposes no supply data. Not an error.
+    return { levels: [], error: null };
+  }
+
+  let session;
+  try {
+    session = snmp.createSession(host, "public", { timeout: 2000, retries: 0, version: snmp.Version2c });
+
+    const walks = Promise.all([
+      snmpWalk(session, SNMP_OID.supplyDesc),
+      snmpWalk(session, SNMP_OID.supplyType),
+      snmpWalk(session, SNMP_OID.supplyMax),
+      snmpWalk(session, SNMP_OID.supplyLevel),
+      snmpWalk(session, SNMP_OID.inputMax),
+      snmpWalk(session, SNMP_OID.inputLevel),
+    ]);
+
+    const walked = await withTimeout(walks, SNMP_TOTAL_TIMEOUT_MS, null);
+    if (walked === null) {
+      return { levels: [], error: `Printer at ${host} did not answer SNMP in time.` };
+    }
+    const [descs, types, maxes, levels, inMax, inLevel] = walked;
+
+    const result = [];
+
+    for (const [index, desc] of descs) {
+      const typeCode = Number(types.get(index));
+      result.push({
+        name: String(desc || `Supply ${index}`),
+        type: SNMP_INK_TYPES.has(typeCode) ? "ink" : "other",
+        levelPercent: toPercent(Number(levels.get(index)), Number(maxes.get(index))),
+      });
+    }
+
+    for (const [index, level] of inLevel) {
+      result.push({
+        // Index is hrDeviceIndex.prtInputIndex — only the tray number is useful
+        name: `Paper tray ${index.split(".").pop()}`,
+        type: "paper",
+        levelPercent: toPercent(Number(level), Number(inMax.get(index))),
+      });
+    }
+
+    if (result.length === 0) {
+      return { levels: [], error: `Printer at ${host} did not report Printer-MIB supply data.` };
+    }
+    return { levels: result, error: null };
+  } catch (err) {
+    return { levels: [], error: `Could not read supply levels over SNMP: ${err.message}` };
+  } finally {
+    try {
+      session?.close();
+    } catch {
+      // already closed
+    }
+  }
+}
+
+async function getSupplyLevels(printer) {
+  if (IS_WINDOWS) return getSupplyLevelsWindows(printer);
+  return { levels: parseSupplyLevelsMac(printer), error: null };
+}
+
 // ── Cross-platform printer status ─────────────────────────────────────────────
 
 // Electron's printer.status codes: 0=Idle, 1=Processing, 2=Paused, 3=Stopped, 4=Error
@@ -153,45 +340,50 @@ async function getMacPrinterStatus(printer) {
 }
 
 async function getWindowsPrinterStatus(printer) {
-  const name = printer.name.replace(/'/g, "''");
   let state = "unknown";
   try {
-    const { stdout } = await execAsync(
-      `powershell -NoProfile -Command "Get-Printer -Name '${name}' | Select-Object -ExpandProperty PrinterStatus"`
-    );
-    const s = stdout.trim().toLowerCase();
-    if (s === "normal") state = "idle";
+    const s = (
+      await runPowerShell(
+        `Get-Printer -Name '${escapePs(printer.name)}' | Select-Object -ExpandProperty PrinterStatus`
+      )
+    ).toLowerCase();
+    if (s === "normal") state = "ready";
     else if (s === "printing") state = "printing";
-    else if (s === "offline" || s === "error" || s === "degraded") state = "stopped";
-  } catch { /* PS unavailable */ }
-
-  const deviceUri = printer.options?.["device-uri"] ?? "";
-  if (deviceUri.startsWith("usb://")) {
-    try {
-      const brand = printer.displayName.split(" ")[0];
-      const { stdout } = await execAsync(
-        `powershell -NoProfile -Command "Get-PnpDevice | Where-Object {$_.FriendlyName -like '*${brand}*'} | Select-Object -ExpandProperty Status"`
-      );
-      if (stdout.trim().toLowerCase() !== "ok") return "disconnected";
-    } catch {
-      return "unknown";
-    }
+    else if (s === "offline" || s === "error" || s === "degraded") state = "queue_stopped";
+  } catch {
+    /* PS unavailable */
   }
 
-  if (state === "printing") return "printing";
-  if (state === "stopped") return "queue_stopped";
-  if (state === "idle") return "ready";
-  return "unknown";
+  // Physical-presence check. Gate on the Windows port name — `device-uri` is a
+  // CUPS-only attribute that Windows never populates.
+  try {
+    const port = (await getWindowsPrinterPort(printer.name)) ?? "";
+    if (/^(USB|DOT4)/i.test(port)) {
+      const brand = printer.displayName.split(" ")[0];
+      const out = await runPowerShell(
+        `Get-PnpDevice | Where-Object {$_.FriendlyName -like '*${escapePs(brand)}*'} | Select-Object -ExpandProperty Status`
+      );
+      const anyOk = out
+        .split(/\r?\n/)
+        .map((l) => l.trim().toLowerCase())
+        .some((l) => l === "ok");
+      if (!anyOk) return "disconnected";
+    }
+  } catch {
+    // Presence check failed — fall through to the queue state we already have
+  }
+
+  return state;
 }
 
 async function getPrinterRealStatus(printer) {
-  if (process.platform === "win32") return getWindowsPrinterStatus(printer);
+  if (IS_WINDOWS) return getWindowsPrinterStatus(printer);
   return getMacPrinterStatus(printer);
 }
 
 // ── IPC: get-device-info ──────────────────────────────────────────────────────
 
-async function detectDuplexSupport(printerName) {
+async function detectDuplexSupportMac(printerName) {
   try {
     const pFlag = printerName ? `-p "${printerName}"` : "";
     const { stdout } = await execAsync(`lpoptions ${pFlag} -l 2>/dev/null`);
@@ -206,6 +398,34 @@ async function detectDuplexSupport(printerName) {
   return false;
 }
 
+async function detectDuplexSupportWindows(printerName) {
+  if (!printerName) return false;
+  const name = escapePs(printerName);
+
+  // Win32_Printer.Capabilities contains 3 when the driver advertises duplex.
+  try {
+    const out = await runPowerShell(
+      `Get-CimInstance Win32_Printer | Where-Object { $_.Name -eq '${name}' } | Select-Object -ExpandProperty Capabilities`
+    );
+    if (out.split(/\r?\n/).some((l) => l.trim() === "3")) return true;
+  } catch { /* WMI unavailable */ }
+
+  // Fallback: the driver's own duplex-unit config property
+  try {
+    const out = await runPowerShell(
+      `Get-PrinterProperty -PrinterName '${name}' -PropertyName 'Config:DuplexUnit' | Select-Object -ExpandProperty Value`
+    );
+    return out.trim().toLowerCase() === "installed";
+  } catch { /* property not exposed by this driver */ }
+
+  return false;
+}
+
+async function detectDuplexSupport(printerName) {
+  if (IS_WINDOWS) return detectDuplexSupportWindows(printerName);
+  return detectDuplexSupportMac(printerName);
+}
+
 ipcMain.handle("get-device-info", async () => {
   if (!mainWindow) return { printer: null, supplyLevels: [], cupsError: null, supportsDuplex: false };
 
@@ -214,13 +434,18 @@ ipcMain.handle("get-device-info", async () => {
 
   if (!defaultPrinter) return { printer: null, supplyLevels: [], cupsError: null, supportsDuplex: false };
 
-  const [realStatus, supplyLevels, supportsDuplex] = await Promise.all([
+  const [realStatus, supplies, supportsDuplex] = await Promise.all([
     getPrinterRealStatus(defaultPrinter),
-    Promise.resolve(parseSupplyLevels(defaultPrinter)),
+    getSupplyLevels(defaultPrinter),
     detectDuplexSupport(defaultPrinter.name),
   ]);
 
-  return { printer: { ...defaultPrinter, realStatus }, supplyLevels, cupsError: null, supportsDuplex };
+  return {
+    printer: { ...defaultPrinter, realStatus },
+    supplyLevels: supplies.levels,
+    cupsError: supplies.error,
+    supportsDuplex,
+  };
 });
 
 // ── IPC: print (HTML) ─────────────────────────────────────────────────────────
@@ -278,30 +503,12 @@ ipcMain.handle("print-hello", async () => {
 });
 
 // ── IPC: print-file (PDF) ─────────────────────────────────────────────────────
-// Uses lpr — Chromium's PDF viewer runs in an OOPIF sub-process so
-// webContents.print() captures a blank frame. lpr sends the raw PDF to CUPS.
+// Chromium's PDF viewer runs in an OOPIF sub-process, so webContents.print()
+// captures a blank frame. Both platforms therefore hand the raw PDF to an
+// external engine: CUPS `lpr` on macOS, bundled SumatraPDF on Windows.
 
-ipcMain.handle("print-file", async (event, options = {}) => {
-  const {
-    fileData,
-    fileName,
-    copies = 1,
-    paperSize = "A4",
-    printerName,
-    colorMode = "color",
-    duplex = "simplex",
-    pageRange,
-  } = options;
-
-  console.log("[Companion] print-file:", { fileName, copies, colorMode, duplex, pageRange, paperSize });
-
-  const buffer = Buffer.from(fileData);
-  const safeName = fileName.replace(/[^a-zA-Z0-9.-]/g, "_");
-  const tempPath = path.join(tmpdir(), `print-${Date.now()}-${safeName}`);
-  await writeFile(tempPath, buffer);
-
-  if (mainWindow) mainWindow.webContents.send("print-stage", "printing");
-
+// macOS — unchanged CUPS path.
+async function printFileMac({ tempPath, copies, paperSize, printerName, colorMode, duplex, pageRange }) {
   const isGrayscale = colorMode === "blackwhite";
 
   try {
@@ -333,6 +540,80 @@ ipcMain.handle("print-file", async (event, options = {}) => {
 
     await execFileAsync("lpr", lprArgs);
     console.log("[Companion] print-file: lpr succeeded");
+  } finally {
+    // Always restore the color default, even if lpr threw
+    if (isGrayscale && printerName) {
+      await execAsync(`lpoptions -p "${printerName}" -o CNIJGrayScale=0 2>/dev/null`).catch(() => {});
+    }
+  }
+}
+
+// Windows — SumatraPDF. The dashboard's paperSize enum is uppercase
+// ('LETTER'|'LEGAL'), but SumatraPDF expects those two lowercase.
+const SUMATRA_PAPER = { A3: "A3", A4: "A4", A5: "A5", LETTER: "letter", LEGAL: "legal" };
+
+function sumatraBinaryPath() {
+  return app.isPackaged
+    ? path.join(process.resourcesPath, "vendor", "win", "SumatraPDF.exe")
+    : path.join(__dirname, "vendor", "win", "SumatraPDF.exe");
+}
+
+async function printFileWindows({ tempPath, copies, paperSize, printerName, colorMode, duplex, pageRange }) {
+  const exe = sumatraBinaryPath();
+  if (!existsSync(exe)) {
+    throw new Error(
+      `Print engine not found at ${exe}. Reinstall the companion app to restore it.`
+    );
+  }
+
+  // -print-settings takes one comma-separated list
+  const settings = [];
+  if (copies > 1) settings.push(`${copies}x`);
+  if (duplex === "longEdge") settings.push("duplexlong");
+  else if (duplex === "shortEdge") settings.push("duplexshort");
+  else settings.push("simplex");
+  if (colorMode === "blackwhite") settings.push("monochrome");
+  const paper = SUMATRA_PAPER[String(paperSize || "").toUpperCase()];
+  if (paper) settings.push(`paper=${paper}`);
+  if (pageRange && pageRange !== "all") settings.push(pageRange);
+
+  const args = [];
+  if (printerName) args.push("-print-to", printerName);
+  else args.push("-print-to-default");
+  args.push("-print-settings", settings.join(","), "-silent", "-exit-when-done", tempPath);
+
+  console.log("[Companion] SumatraPDF args:", args);
+  await execFileAsync(exe, args, { windowsHide: true });
+  console.log("[Companion] print-file: SumatraPDF succeeded");
+}
+
+ipcMain.handle("print-file", async (event, options = {}) => {
+  const {
+    fileData,
+    fileName,
+    copies = 1,
+    paperSize = "A4",
+    printerName,
+    colorMode = "color",
+    duplex = "simplex",
+    pageRange,
+  } = options;
+
+  console.log("[Companion] print-file:", { fileName, copies, colorMode, duplex, pageRange, paperSize });
+
+  const buffer = Buffer.from(fileData);
+  const safeName = fileName.replace(/[^a-zA-Z0-9.-]/g, "_");
+  const tempPath = path.join(tmpdir(), `print-${Date.now()}-${safeName}`);
+  await writeFile(tempPath, buffer);
+
+  if (mainWindow) mainWindow.webContents.send("print-stage", "printing");
+
+  const job = { tempPath, copies, paperSize, printerName, colorMode, duplex, pageRange };
+
+  try {
+    if (IS_WINDOWS) await printFileWindows(job);
+    else await printFileMac(job);
+
     if (mainWindow) mainWindow.webContents.send("print-stage", "complete");
     return { success: true, stage: "complete" };
   } catch (error) {
@@ -340,24 +621,62 @@ ipcMain.handle("print-file", async (event, options = {}) => {
     if (mainWindow) mainWindow.webContents.send("print-stage", "error");
     return { success: false, stage: "error", error: error.message };
   } finally {
-    // Always restore color default and clean up the temp file
-    if (isGrayscale && printerName) {
-      await execAsync(`lpoptions -p "${printerName}" -o CNIJGrayScale=0 2>/dev/null`).catch(() => {});
-    }
     setTimeout(() => unlink(tempPath).catch(() => {}), 5000);
   }
 });
 
 // ── IPC: get-print-queue ──────────────────────────────────────────────────────
 
+// Windows PowerShell 5.1 serialises DateTime as "/Date(1700000000000)/";
+// PowerShell 7 emits ISO-8601.
+function parsePsDate(value) {
+  if (typeof value === "string") {
+    const epoch = value.match(/\/Date\((\d+)\)\//);
+    if (epoch) return new Date(Number(epoch[1])).toISOString();
+    const parsed = new Date(value);
+    if (!isNaN(parsed.getTime())) return parsed.toISOString();
+  }
+  return new Date().toISOString();
+}
+
+async function getPrintQueueWindows() {
+  if (!mainWindow) return [];
+  try {
+    const printers = await mainWindow.webContents.getPrintersAsync();
+    const def = printers.find((p) => p.isDefault) || printers[0] || null;
+    if (!def) return [];
+
+    const out = await runPowerShell(
+      `Get-PrintJob -PrinterName '${escapePs(def.name)}' | Select-Object Id, DocumentName, SubmittedTime | ConvertTo-Json -Compress`
+    );
+    if (!out) return [];
+
+    const parsed = JSON.parse(out);
+    const jobs = Array.isArray(parsed) ? parsed : [parsed];
+
+    return jobs.filter(Boolean).map((j) => ({
+      id: String(j.Id),
+      fileName: j.DocumentName || "Untitled",
+      status: "pending",
+      createdAt: parsePsDate(j.SubmittedTime),
+    }));
+  } catch {
+    // No spooler access, no jobs, or unparseable output — treat as empty queue
+    return [];
+  }
+}
+
 ipcMain.handle("get-print-queue", async () => {
-  // No CUPS dependency — return empty; companion doesn't track the OS spooler.
+  if (IS_WINDOWS) return getPrintQueueWindows();
+  // macOS: no CUPS dependency — companion doesn't track the OS spooler.
   return [];
 });
 
 // ── IPC: print-file-native (PDF via webContents.print) ────────────────────────
-// Uses Electron's webContents.print() so color/pageRanges/duplexMode are
-// applied by Chromium itself — no PPD option guessing needed.
+// Unused by the dashboard — kept for the printer-test page. Note: pageSize below
+// forwards the dashboard's uppercase enum, which Chromium rejects for
+// 'LETTER'/'LEGAL' (it wants 'Letter'/'Legal'). See SUMATRA_PAPER for the
+// equivalent mapping if this handler is ever put back into service.
 
 function parsePageRangesNative(rangeStr) {
   // Converts 1-indexed UI format ("2-5", "1,3") to Electron's 0-indexed [{from,to}]
