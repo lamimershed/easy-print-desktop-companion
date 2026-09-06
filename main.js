@@ -39,6 +39,13 @@ function createWindow() {
   console.log("[Companion] Loading URL:", WEB_APP_URL);
   mainWindow.loadURL(WEB_APP_URL);
 
+  // Mirror the dashboard's console into the main process log, so launching the
+  // exe from a terminal is enough to see why a socket will not connect.
+  mainWindow.webContents.on("console-message", (_event, level, message) => {
+    if (message.startsWith("[socket]")) console.log("[Renderer]", message);
+    else if (level >= 2) console.error("[Renderer]", message);
+  });
+
   mainWindow.webContents.on("did-fail-load", (event, errorCode, errorDesc, validatedURL) => {
     console.error("[Companion] Failed to load:", validatedURL, errorCode, errorDesc);
     mainWindow.loadURL(`data:text/html,<html><body style="font-family:sans-serif;padding:40px;background:#1a4d30;color:white;">
@@ -61,7 +68,23 @@ function createWindow() {
     `);
   });
 
-  if (!app.isPackaged) mainWindow.webContents.openDevTools();
+  if (!app.isPackaged || process.argv.includes("--devtools")) {
+    mainWindow.webContents.openDevTools();
+  }
+
+  // A packaged build had no way to show its console, so a shop PC that could not
+  // reach the server looked exactly like one that could — the only difference
+  // being what customers saw. Ctrl+Shift+I (Cmd+Alt+I on macOS) opens it, and
+  // `--devtools` opens it from launch.
+  mainWindow.webContents.on("before-input-event", (event, input) => {
+    const toggleCombo = IS_WINDOWS
+      ? input.control && input.shift && input.key.toLowerCase() === "i"
+      : input.meta && input.alt && input.key.toLowerCase() === "i";
+    if (toggleCombo) {
+      mainWindow.webContents.toggleDevTools();
+      event.preventDefault();
+    }
+  });
 }
 
 // ── Printer status polling ────────────────────────────────────────────────────
