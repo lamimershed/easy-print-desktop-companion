@@ -1,5 +1,13 @@
-require("dotenv").config({ path: require("path").join(__dirname, ".env") });
 const { app, BrowserWindow, ipcMain } = require("electron");
+
+// A packaged build reads .env.production — the only env file electron-builder
+// bundles. Dev reads .env, which stays untracked and points at whatever machine
+// you are working on. Shipping .env instead was how installed copies ended up
+// loading http://localhost:5175 on the customer's own machine.
+require("dotenv").config({
+  path: require("path").join(__dirname, app.isPackaged ? ".env.production" : ".env"),
+});
+
 const path = require("path");
 const { existsSync } = require("fs");
 const { writeFile, unlink } = require("fs/promises");
@@ -58,8 +66,41 @@ function createWindow() {
 
 // ── Printer status polling ────────────────────────────────────────────────────
 
+// The numeric poll is cheap (an Electron call). Resolving realStatus is not —
+// on Windows it shells out to PowerShell — so it runs only when the numeric
+// status moved or REAL_STATUS_MAX_AGE_MS has passed since the last resolve.
+const REAL_STATUS_MAX_AGE_MS = 30_000;
+
 let _lastPrinterStatus = null;
+let _lastRealStatus = null;
+let _lastRealStatusAt = 0;
 let _printerPollTimer = null;
+
+/** Resolves realStatus for the default printer. Returns 'disconnected' when there is none. */
+async function resolveDefaultPrinterRealStatus() {
+  if (!mainWindow || mainWindow.isDestroyed()) return _lastRealStatus;
+  const printers = await mainWindow.webContents.getPrintersAsync();
+  const def = printers.find((p) => p.isDefault) || printers[0] || null;
+  if (!def) return "disconnected";
+  return getPrinterRealStatus(def);
+}
+
+/**
+ * Pushes realStatus to the renderer whenever it changes, so the dashboard can
+ * forward it to the backend without polling the expensive get-device-info path
+ * on every page.
+ */
+async function refreshRealStatus({ force = false } = {}) {
+  const real = await resolveDefaultPrinterRealStatus();
+  _lastRealStatusAt = Date.now();
+  if (real !== _lastRealStatus || force) {
+    _lastRealStatus = real;
+    if (mainWindow && !mainWindow.isDestroyed()) {
+      mainWindow.webContents.send("printer-real-status", real);
+    }
+  }
+  return real;
+}
 
 function startPrinterStatusPolling() {
   const poll = async () => {
@@ -68,9 +109,13 @@ function startPrinterStatusPolling() {
       const printers = await mainWindow.webContents.getPrintersAsync();
       const def = printers.find((p) => p.isDefault) || printers[0] || null;
       const status = def ? def.status : -1;
-      if (status !== _lastPrinterStatus) {
+      const numericChanged = status !== _lastPrinterStatus;
+      if (numericChanged) {
         _lastPrinterStatus = status;
         mainWindow.webContents.send("printer-status-change", status);
+      }
+      if (numericChanged || Date.now() - _lastRealStatusAt >= REAL_STATUS_MAX_AGE_MS) {
+        await refreshRealStatus();
       }
     } catch {
       // Window may be closing — ignore
@@ -98,6 +143,18 @@ app.whenReady().then(() => {
 app.on("window-all-closed", () => {
   stopPrinterStatusPolling();
   if (process.platform !== "darwin") app.quit();
+});
+
+// ── IPC: get-printer-real-status ──────────────────────────────────────────────
+// Cheap targeted probe — skips the supply-level and duplex work in
+// get-device-info. Used by the dashboard to report printer state to the backend.
+
+ipcMain.handle("get-printer-real-status", async () => {
+  try {
+    return await refreshRealStatus({ force: true });
+  } catch {
+    return "unknown";
+  }
 });
 
 // ── IPC: get-printers ─────────────────────────────────────────────────────────

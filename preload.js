@@ -40,5 +40,18 @@ contextBridge.exposeInMainWorld("electronAPI", {
   // Unsubscribe all printer-status-change listeners (safe — only usePrinterFeedback subscribes)
   offPrinterStatusChange: (_cb) =>
     ipcRenderer.removeAllListeners("printer-status-change"),
+
+  // Resolve the physical printer state on demand: 'ready' | 'printing' |
+  // 'queue_stopped' | 'disconnected' | 'unknown'. Cheaper than getDeviceInfo.
+  getPrinterRealStatus: () => ipcRenderer.invoke("get-printer-real-status"),
+
+  // Subscribe to realStatus changes pushed by the main process. Separate channel
+  // from printer-status-change so the status reporter and usePrinterFeedback
+  // can subscribe independently.
+  onPrinterRealStatus: (cb) =>
+    ipcRenderer.on("printer-real-status", (_event, status) => cb(status)),
+
+  // Unsubscribe all printer-real-status listeners
+  offPrinterRealStatus: () => ipcRenderer.removeAllListeners("printer-real-status"),
 });
 
