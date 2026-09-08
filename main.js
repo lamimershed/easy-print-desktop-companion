@@ -1,4 +1,4 @@
-const { app, BrowserWindow, ipcMain } = require("electron");
+const { app, BrowserWindow, ipcMain, powerMonitor } = require("electron");
 
 // A packaged build reads .env.production — the only env file electron-builder
 // bundles. Dev reads .env, which stays untracked and points at whatever machine
@@ -125,9 +125,24 @@ async function refreshRealStatus({ force = false } = {}) {
   return real;
 }
 
+/**
+ * Non-zero while a print is being watched.
+ *
+ * The spool watchdog polls PowerShell every 1.5s and every probe here is
+ * serialised behind it, so a status poll running alongside a print only adds
+ * latency to the poll that actually matters — and the watchdog reports printer
+ * trouble in far more detail anyway. The status poll stands down until the job
+ * is done.
+ */
+let _printsInFlight = 0;
+
 function startPrinterStatusPolling() {
   const poll = async () => {
     if (!mainWindow || mainWindow.isDestroyed()) return;
+    if (_printsInFlight > 0) {
+      _printerPollTimer = setTimeout(poll, 5000);
+      return;
+    }
     try {
       const printers = await mainWindow.webContents.getPrintersAsync();
       const def = printers.find((p) => p.isDefault) || printers[0] || null;
@@ -155,13 +170,53 @@ function stopPrinterStatusPolling() {
   }
 }
 
-app.whenReady().then(() => {
-  createWindow();
-  startPrinterStatusPolling();
-  app.on("activate", () => {
-    if (BrowserWindow.getAllWindows().length === 0) createWindow();
+// One companion per shop PC.
+//
+// Both copies answer `client:join` for the same client, and the backend hands
+// jobs to whichever socket connected last — so the window the staff are looking
+// at is not necessarily the one that prints, and two spool watchdogs poll the
+// same queue and disagree about it. Staff double-click the desktop icon; this is
+// the cheapest way to make that harmless.
+const gotSingleInstanceLock = app.requestSingleInstanceLock();
+
+if (!gotSingleInstanceLock) {
+  console.log("[Companion] Another instance is already running — exiting.");
+  app.quit();
+} else {
+  app.on("second-instance", () => {
+    if (!mainWindow || mainWindow.isDestroyed()) return;
+    if (mainWindow.isMinimized()) mainWindow.restore();
+    mainWindow.show();
+    mainWindow.focus();
   });
-});
+
+  app.whenReady().then(() => {
+    createWindow();
+    startPrinterStatusPolling();
+    watchPowerEvents();
+    app.on("activate", () => {
+      if (BrowserWindow.getAllWindows().length === 0) createWindow();
+    });
+  });
+}
+
+/**
+ * A shop PC sleeps overnight, and the backend gates customer uploads on the
+ * last printer status this app reported. Without this the woken machine keeps
+ * advertising whatever it saw before it slept — most damagingly "ready" for a
+ * printer that has since been switched off — until the 30s status poll happens
+ * to come round and notice. Re-probe the moment we are back.
+ */
+function watchPowerEvents() {
+  const reprobe = (why) => {
+    console.log(`[Companion] ${why} — re-probing printer status`);
+    // Nothing to be done if it fails: the regular poll is still running.
+    void refreshRealStatus({ force: true }).catch(() => {});
+  };
+
+  powerMonitor.on("resume", () => reprobe("system resumed"));
+  powerMonitor.on("unlock-screen", () => reprobe("screen unlocked"));
+}
 
 app.on("window-all-closed", () => {
   stopPrinterStatusPolling();
@@ -195,13 +250,55 @@ function escapePs(value) {
   return String(value).replace(/'/g, "''");
 }
 
-async function runPowerShell(script) {
-  const { stdout } = await execFileAsync(
-    "powershell",
-    ["-NoProfile", "-NonInteractive", "-Command", script],
-    { windowsHide: true }
-  );
-  return stdout.trim();
+/**
+ * A probe that has not answered by now is not going to.
+ *
+ * Nothing here had a timeout before, and `Get-Printer` against a printer that
+ * has dropped off the network genuinely never returns on some driver/port
+ * combinations. One of those inside the spool watchdog's poll loop hangs the
+ * loop for the life of the app: the job reaches no outcome, the customer waits
+ * on "Printing…" forever, and only the reconciler's refund ends it.
+ */
+const PS_TIMEOUT_MS = 8000;
+
+/**
+ * PowerShell probes run one at a time.
+ *
+ * Each one costs a powershell.exe launch — a few hundred milliseconds on a shop
+ * PC — and the spool watchdog polls every 1.5s while the printer-status poll
+ * runs every 5s. Unserialised those overlap, and on exactly the machine where it
+ * matters (a printer that has gone offline, so every call is slow) they pile up
+ * processes faster than they retire. The queue holds it to one; the timeout
+ * stops a wedged call from holding the queue.
+ */
+let _psQueue = Promise.resolve();
+
+function runPowerShell(script) {
+  const run = async () => {
+    try {
+      const { stdout } = await execFileAsync(
+        "powershell",
+        ["-NoProfile", "-NonInteractive", "-Command", script],
+        {
+          windowsHide: true,
+          timeout: PS_TIMEOUT_MS,
+          killSignal: "SIGKILL",
+          maxBuffer: 4 * 1024 * 1024,
+        }
+      );
+      return stdout.trim();
+    } catch (err) {
+      if (err.killed) {
+        throw new Error(`PowerShell probe timed out after ${PS_TIMEOUT_MS}ms`);
+      }
+      throw err;
+    }
+  };
+
+  // `then(run, run)` so one failed probe does not stall every probe behind it.
+  const result = _psQueue.then(run, run);
+  _psQueue = result.catch(() => {});
+  return result;
 }
 
 async function getWindowsPrinterPort(printerName) {
@@ -419,6 +516,35 @@ async function getMacPrinterStatus(printer) {
   return ELECTRON_STATUS_MAP[printer.status] ?? "unknown";
 }
 
+/**
+ * Is the printer physically there?
+ *
+ * Windows will happily report a switched-off USB printer as `Normal` and queue
+ * into it forever, so the queue state alone cannot answer this. Gate on the
+ * Windows port name — `device-uri` is a CUPS-only attribute Windows never
+ * populates.
+ *
+ * Returns true/false only for a local port we could actually check, and null
+ * when the question does not apply (network printer) or could not be answered.
+ */
+async function probeWindowsPrinterPresent(printerName, brandHint) {
+  try {
+    const port = (await getWindowsPrinterPort(printerName)) ?? "";
+    if (!/^(USB|DOT4)/i.test(port)) return null;
+
+    const brand = String(brandHint || printerName).split(" ")[0];
+    const out = await runPowerShell(
+      `Get-PnpDevice | Where-Object {$_.FriendlyName -like '*${escapePs(brand)}*'} | Select-Object -ExpandProperty Status`
+    );
+    return out
+      .split(/\r?\n/)
+      .map((l) => l.trim().toLowerCase())
+      .some((l) => l === "ok");
+  } catch {
+    return null;
+  }
+}
+
 async function getWindowsPrinterStatus(printer) {
   let state = "unknown";
   try {
@@ -434,24 +560,8 @@ async function getWindowsPrinterStatus(printer) {
     /* PS unavailable */
   }
 
-  // Physical-presence check. Gate on the Windows port name — `device-uri` is a
-  // CUPS-only attribute that Windows never populates.
-  try {
-    const port = (await getWindowsPrinterPort(printer.name)) ?? "";
-    if (/^(USB|DOT4)/i.test(port)) {
-      const brand = printer.displayName.split(" ")[0];
-      const out = await runPowerShell(
-        `Get-PnpDevice | Where-Object {$_.FriendlyName -like '*${escapePs(brand)}*'} | Select-Object -ExpandProperty Status`
-      );
-      const anyOk = out
-        .split(/\r?\n/)
-        .map((l) => l.trim().toLowerCase())
-        .some((l) => l === "ok");
-      if (!anyOk) return "disconnected";
-    }
-  } catch {
-    // Presence check failed — fall through to the queue state we already have
-  }
+  const present = await probeWindowsPrinterPresent(printer.name, printer.displayName);
+  if (present === false) return "disconnected";
 
   return state;
 }
@@ -582,50 +692,419 @@ ipcMain.handle("print-hello", async () => {
   return true;
 });
 
+// ── Spool watchdog ────────────────────────────────────────────────────────────
+// Submitting is not printing. `lpr` returns once CUPS accepts the job and
+// SumatraPDF exits once the Windows spooler accepts it — both succeed while the
+// printer is offline, jammed, paused or out of paper. Everything below exists to
+// turn "submitted" into an outcome we actually observed.
+
+const POLL_MS = 1500;
+/** Longest we wait for a submitted job to surface in the spooler. */
+const SUBMIT_TIMEOUT_MS = 60_000;
+/** No page progress for this long, job still queued → the printer gave up. */
+const IDLE_TIMEOUT_MS = 3 * 60_000;
+/** How long a recoverable block (paper out, offline) may last before we give up. */
+const BLOCKED_GRACE_MS = 2 * 60_000;
+/**
+ * Consecutive unreadable spooler polls tolerated before we stop watching.
+ *
+ * A single unreadable poll is not evidence of anything — PowerShell probes carry
+ * a timeout now, and a busy shop PC can miss one. Treating the first one as
+ * "the job is gone, call it a success" would report a print nobody watched every
+ * time the machine hiccuped.
+ */
+const MAX_SPOOLER_READ_FAILURES = 4;
+
+// Terminal — the job is gone and is not coming back.
+const FATAL_JOB_STATES = [
+  { re: /Deleted/i, code: "CANCELLED", message: "The print job was cancelled at the printer." },
+  { re: /Error/i, code: "PRINTER_ERROR", message: "The printer reported an error." },
+];
+
+// Recoverable — the shop can fix these and the job resumes on its own, so they
+// are reported as a live reason rather than a failure until the grace runs out.
+const BLOCKED_JOB_STATES = [
+  { re: /PaperOut/i, code: "PAPER_OUT", message: "The printer is out of paper." },
+  { re: /Offline/i, code: "OFFLINE", message: "The printer went offline." },
+  { re: /UserIntervention/i, code: "NEEDS_ATTENTION", message: "The printer needs attention." },
+  { re: /BlockedDeviceQuery/i, code: "BLOCKED", message: "The printer is not responding." },
+  { re: /Paused/i, code: "PAUSED", message: "The print job is paused." },
+];
+
+// `Retained` is a finished job held back by "Keep printed documents" — a success.
+const DONE_JOB_STATES = /Printed|Complete|Retained/i;
+
+class PrintFailure extends Error {
+  constructor(code, message) {
+    super(message);
+    this.name = "PrintFailure";
+    this.code = code;
+  }
+}
+
+function classifyJobStatus(status) {
+  const s = String(status || "");
+  if (DONE_JOB_STATES.test(s)) return { done: true };
+  const fatal = FATAL_JOB_STATES.find((f) => f.re.test(s));
+  if (fatal) return { fatal: { code: fatal.code, message: fatal.message } };
+  const blocked = BLOCKED_JOB_STATES.find((b) => b.re.test(s));
+  if (blocked) return { blocked: { code: blocked.code, message: blocked.message } };
+  return {};
+}
+
+function escapeShellArg(value) {
+  return String(value).replace(/(["\\$`])/g, "\\$1");
+}
+
+async function resolveDefaultPrinterName() {
+  if (!mainWindow || mainWindow.isDestroyed()) return null;
+  const printers = await mainWindow.webContents.getPrintersAsync();
+  const def = printers.find((p) => p.isDefault) || printers[0] || null;
+  return def ? def.name : null;
+}
+
+// ── Windows spooler ───────────────────────────────────────────────────────────
+
+// ConvertTo-Json renders the JobStatus flag enum as an integer under PowerShell
+// 5.1 and serialises a lone job as an object rather than an array. [string] and
+// @() force both into the shape this parser expects.
+const PS_JOB_SELECT =
+  "Select-Object Id, DocumentName, PagesPrinted, TotalPages, " +
+  "@{n='Status';e={[string]$_.JobStatus}}";
+
+async function listJobsWindows(printerName) {
+  const out = await runPowerShell(
+    `@(Get-PrintJob -PrinterName '${escapePs(printerName)}' -ErrorAction SilentlyContinue | ` +
+      `${PS_JOB_SELECT}) | ConvertTo-Json -Compress -Depth 3`
+  ).catch(() => null);
+
+  // null means the spooler could not be read at all, which is not the same as an
+  // empty queue. Conflating the two is how a PowerShell failure gets reported to
+  // the customer as a successful print.
+  if (out === null) return null;
+  if (!out) return [];
+
+  let parsed;
+  try {
+    parsed = JSON.parse(out);
+  } catch {
+    return null;
+  }
+
+  const arr = Array.isArray(parsed) ? parsed : [parsed];
+  return arr.filter(Boolean).map((j) => ({
+    id: String(j.Id),
+    name: j.DocumentName || "",
+    pagesPrinted: Number(j.PagesPrinted) || 0,
+    totalPages: Number(j.TotalPages) || 0,
+    status: String(j.Status || ""),
+  }));
+}
+
+// Windows queues into a black hole when the printer is paused, offline, or has
+// "Use Printer Offline" ticked — and SumatraPDF exits 0 regardless. Refusing up
+// front is the only honest answer.
+async function preflightWindows(printerName) {
+  const spooler = await runPowerShell("(Get-Service -Name Spooler).Status").catch(() => "");
+  if (spooler && spooler.trim().toLowerCase() !== "running") {
+    return {
+      ok: false,
+      code: "SPOOLER_DOWN",
+      message: "The Windows Print Spooler service is not running.",
+    };
+  }
+
+  const name = printerName || (await resolveDefaultPrinterName());
+  if (!name) return { ok: false, code: "NO_PRINTER", message: "No printer is installed." };
+
+  const raw = await runPowerShell(
+    `Get-Printer -Name '${escapePs(name)}' | ` +
+      "Select-Object @{n='Status';e={[string]$_.PrinterStatus}}, WorkOffline | ConvertTo-Json -Compress"
+  ).catch(() => "");
+  // No PowerShell access — proceed rather than block the shop entirely; the
+  // watchdog still reports whatever the spooler is willing to tell us.
+  if (!raw) return { ok: true, printerName: name };
+
+  let info;
+  try {
+    info = JSON.parse(raw);
+  } catch {
+    return { ok: true, printerName: name };
+  }
+
+  // The single most common silent-queue cause on Windows.
+  if (info.WorkOffline === true) {
+    return {
+      ok: false,
+      code: "WORK_OFFLINE",
+      message: `"${name}" is set to Use Printer Offline in Windows.`,
+    };
+  }
+
+  const s = String(info.Status || "").toLowerCase();
+  if (s.includes("paused")) return { ok: false, code: "PAUSED", message: `"${name}" is paused.` };
+  if (s.includes("offline")) return { ok: false, code: "OFFLINE", message: `"${name}" is offline.` };
+  if (s.includes("error")) {
+    return { ok: false, code: "PRINTER_ERROR", message: `"${name}" is reporting an error.` };
+  }
+
+  // A switched-off or unplugged USB printer reports `Normal` right up until you
+  // print into it, at which point the job sits in the queue showing nothing in
+  // particular — so the watchdog could only end it by timing out three minutes
+  // later. Asking the device layer costs one probe and answers now.
+  if ((await probeWindowsPrinterPresent(name)) === false) {
+    return {
+      ok: false,
+      code: "DISCONNECTED",
+      message: `"${name}" is not connected. Check that it is switched on and plugged in.`,
+    };
+  }
+
+  return { ok: true, printerName: name };
+}
+
+// ── macOS spooler ─────────────────────────────────────────────────────────────
+
+/** True when CUPS has stopped the queue — jobs pile up instead of printing. */
+async function probeQueueStoppedMac(printerName) {
+  if (!printerName) return false;
+  const out = await execAsync(`lpstat -p "${escapeShellArg(printerName)}"`)
+    .then((r) => r.stdout)
+    .catch(() => "");
+  return /\bdisabled\b|\bstopped\b/i.test(out);
+}
+
+// CUPS job ids are the first field of each `lpstat -o` line ("Canon_TS3300-123").
+// CUPS exposes no per-job error state, so a blocked job is inferred from the
+// queue being stopped — the same condition Windows reports as Offline.
+async function listJobsMac(printerName) {
+  const target = printerName ? ` "${escapeShellArg(printerName)}"` : "";
+  const stdout = await execAsync(`lpstat -o${target}`)
+    .then((r) => r.stdout)
+    .catch((err) => (typeof err.stdout === "string" ? err.stdout : null));
+  if (stdout === null) return null;
+
+  const lines = stdout
+    .split(/\r?\n/)
+    .map((l) => l.trim())
+    .filter(Boolean);
+  if (lines.length === 0) return [];
+
+  const stopped = await probeQueueStoppedMac(printerName);
+  return lines.map((line) => {
+    const id = line.split(/\s+/)[0];
+    return {
+      id,
+      name: id,
+      pagesPrinted: 0,
+      totalPages: 0,
+      status: stopped ? "Offline" : "",
+    };
+  });
+}
+
+async function preflightMac(printerName) {
+  const name = printerName || (await resolveDefaultPrinterName());
+  if (!name) return { ok: false, code: "NO_PRINTER", message: "No printer is installed." };
+  if (await probeQueueStoppedMac(name)) {
+    return { ok: false, code: "QUEUE_STOPPED", message: `The "${name}" queue is stopped.` };
+  }
+  return { ok: true, printerName: name };
+}
+
+// ── The watchdog itself ───────────────────────────────────────────────────────
+
+/**
+ * Runs `submit`, then follows the job through the OS spooler until it reaches a
+ * state worth reporting. Three outcomes, deliberately — collapsing the third
+ * into "success" is what made the customer's status untrustworthy:
+ *
+ *   confirmed success   — the spooler showed us the job finish
+ *   unconfirmed success — submitted cleanly, but we never got a view of the job
+ *   PrintFailure        — a classified, human-readable reason
+ */
+async function watchSpoolJob({ printerName, listJobs, submit, onStage, expectName }) {
+  const before = new Set(((await listJobs(printerName)) || []).map((j) => j.id));
+
+  onStage({ stage: "spooling" });
+
+  // Poll from the moment we submit: a short job can finish before the submitting
+  // process even exits, and awaiting it first would miss the job entirely.
+  let submitError = null;
+  const submitted = submit();
+  submitted.catch((err) => {
+    submitError = err;
+  });
+
+  let jobId = null;
+  let lastPages = -1;
+  let lastProgressAt = Date.now();
+  let blockedSince = null;
+  let blockedCode = null;
+  let readFailures = 0;
+  const appearBy = Date.now() + SUBMIT_TIMEOUT_MS;
+
+  for (;;) {
+    await new Promise((r) => setTimeout(r, POLL_MS));
+    if (submitError) throw submitError;
+
+    const jobs = await listJobs(printerName).catch(() => null);
+
+    if (jobs === null) {
+      // Unreadable, which is not the same as empty. Ride out a few of these
+      // before giving up on watching — and when we do give up, say so, rather
+      // than claiming an outcome we never saw.
+      if (++readFailures < MAX_SPOOLER_READ_FAILURES) continue;
+      console.warn(
+        `[Companion] spooler unreadable ${readFailures}x — reporting an unconfirmed result`
+      );
+      // Unguarded on purpose: we never got a view of this job, so if the submit
+      // itself failed that is the only thing we know about it and it wins.
+      await submitted;
+      return { success: true, stage: "complete", confirmed: false };
+    }
+    readFailures = 0;
+
+    if (!jobId) {
+      // Both engines name the spooler job after the file. Prefer that match so a
+      // second job arriving at the same printer cannot be mistaken for ours.
+      const candidates = jobs.filter((j) => !before.has(j.id));
+      const fresh =
+        (expectName && candidates.find((j) => j.name.includes(expectName))) || candidates[0];
+      if (fresh) {
+        jobId = fresh.id;
+        onStage({
+          stage: "printing",
+          pagesPrinted: fresh.pagesPrinted,
+          totalPages: fresh.totalPages,
+        });
+        continue;
+      }
+      if (Date.now() > appearBy) {
+        await submitted;
+        // Submitted cleanly, never surfaced, never errored: it printed faster
+        // than we could observe, or this driver bypasses the spooler.
+        return { success: true, stage: "complete", confirmed: false };
+      }
+      continue;
+    }
+
+    const cur = jobs.find((j) => j.id === jobId);
+    if (!cur) {
+      // Left the queue without ever showing an error state — it printed.
+      await submitted.catch(() => {});
+      return { success: true, stage: "complete", confirmed: true };
+    }
+
+    const verdict = classifyJobStatus(cur.status);
+
+    if (verdict.done) {
+      await submitted.catch(() => {});
+      return { success: true, stage: "complete", confirmed: true };
+    }
+
+    if (verdict.fatal) throw new PrintFailure(verdict.fatal.code, verdict.fatal.message);
+
+    if (verdict.blocked) {
+      if (blockedSince === null) blockedSince = Date.now();
+      // Only on transition. Re-emitting every poll would put ~80 identical
+      // events a minute through IPC and on to the customer's socket.
+      if (blockedCode !== verdict.blocked.code) {
+        blockedCode = verdict.blocked.code;
+        onStage({
+          stage: "blocked",
+          code: verdict.blocked.code,
+          message: verdict.blocked.message,
+          pagesPrinted: cur.pagesPrinted,
+          totalPages: cur.totalPages,
+        });
+      }
+      if (Date.now() - blockedSince > BLOCKED_GRACE_MS) {
+        throw new PrintFailure(verdict.blocked.code, verdict.blocked.message);
+      }
+      continue;
+    }
+
+    blockedSince = null;
+    blockedCode = null;
+
+    if (cur.pagesPrinted !== lastPages) {
+      lastPages = cur.pagesPrinted;
+      lastProgressAt = Date.now();
+      onStage({
+        stage: "printing",
+        pagesPrinted: cur.pagesPrinted,
+        totalPages: cur.totalPages,
+      });
+    } else if (Date.now() - lastProgressAt > IDLE_TIMEOUT_MS) {
+      throw new PrintFailure("STALLED", "The printer stopped responding mid-job.");
+    }
+  }
+}
+
 // ── IPC: print-file (PDF) ─────────────────────────────────────────────────────
 // Chromium's PDF viewer runs in an OOPIF sub-process, so webContents.print()
 // captures a blank frame. Both platforms therefore hand the raw PDF to an
 // external engine: CUPS `lpr` on macOS, bundled SumatraPDF on Windows.
 
-// macOS — unchanged CUPS path.
-async function printFileMac({ tempPath, copies, paperSize, printerName, colorMode, duplex, pageRange }) {
+function buildLprArgs({ tempPath, copies, paperSize, printerName, colorMode, duplex, pageRange }) {
   const isGrayscale = colorMode === "blackwhite";
+  const lprArgs = [];
+  if (printerName) lprArgs.push("-P", printerName);
+  if (copies > 1) lprArgs.push("-#", String(copies));
 
-  try {
-    // Canon's CUPS filter reads CNIJGrayScale from the printer's stored defaults,
-    // not from per-job -o options. Set the default before printing, restore after.
-    if (isGrayscale && printerName) {
-      await execAsync(`lpoptions -p "${printerName}" -o CNIJGrayScale=1 2>/dev/null`).catch(() => {});
+  // Standard IPP color mode (honoured by non-Canon drivers)
+  lprArgs.push("-o", isGrayscale ? "print-color-mode=monochrome" : "print-color-mode=color");
+
+  // The customer was charged for this size, so print on it.
+  if (paperSize) lprArgs.push("-o", `media=${paperSize}`);
+  if (duplex === "longEdge") lprArgs.push("-o", "sides=two-sided-long-edge");
+  else if (duplex === "shortEdge") lprArgs.push("-o", "sides=two-sided-short-edge");
+  else lprArgs.push("-o", "sides=one-sided");
+
+  // Page range — standard CUPS `page-ranges` (1-indexed, already in UI format)
+  if (pageRange && pageRange !== "all") lprArgs.push("-o", `page-ranges=${pageRange}`);
+
+  lprArgs.push(tempPath);
+  return lprArgs;
+}
+
+async function printFileMac(job, onStage) {
+  const pre = await preflightMac(job.printerName);
+  if (!pre.ok) throw new PrintFailure(pre.code, pre.message);
+  const printerName = pre.printerName;
+  const isGrayscale = job.colorMode === "blackwhite";
+
+  const submit = async () => {
+    try {
+      // Canon's CUPS filter reads CNIJGrayScale from the printer's stored
+      // defaults, not from per-job -o options. Set before printing, restore after.
+      if (isGrayscale) {
+        await execAsync(
+          `lpoptions -p "${escapeShellArg(printerName)}" -o CNIJGrayScale=1 2>/dev/null`
+        ).catch(() => {});
+      }
+      const lprArgs = buildLprArgs({ ...job, printerName });
+      console.log("[Companion] lpr args:", lprArgs);
+      await execFileAsync("lpr", lprArgs);
+      console.log("[Companion] print-file: lpr accepted the job");
+    } finally {
+      // Always restore the color default, even if lpr threw
+      if (isGrayscale) {
+        await execAsync(
+          `lpoptions -p "${escapeShellArg(printerName)}" -o CNIJGrayScale=0 2>/dev/null`
+        ).catch(() => {});
+      }
     }
+  };
 
-    const lprArgs = [];
-    if (printerName) lprArgs.push("-P", printerName);
-    if (copies > 1) lprArgs.push("-#", String(copies));
-
-    // Standard IPP color mode (honoured by non-Canon drivers)
-    lprArgs.push("-o", isGrayscale ? "print-color-mode=monochrome" : "print-color-mode=color");
-
-    // Duplex — IPP standard `sides` option
-    // The customer was charged for this size, so print on it.
-    if (paperSize) lprArgs.push("-o", `media=${paperSize}`);
-    if (duplex === "longEdge") lprArgs.push("-o", "sides=two-sided-long-edge");
-    else if (duplex === "shortEdge") lprArgs.push("-o", "sides=two-sided-short-edge");
-    else lprArgs.push("-o", "sides=one-sided");
-
-    // Page range — standard CUPS `page-ranges` (1-indexed, already in UI format)
-    if (pageRange && pageRange !== "all") lprArgs.push("-o", `page-ranges=${pageRange}`);
-
-    lprArgs.push(tempPath);
-    console.log("[Companion] lpr args:", lprArgs);
-
-    await execFileAsync("lpr", lprArgs);
-    console.log("[Companion] print-file: lpr succeeded");
-  } finally {
-    // Always restore the color default, even if lpr threw
-    if (isGrayscale && printerName) {
-      await execAsync(`lpoptions -p "${printerName}" -o CNIJGrayScale=0 2>/dev/null`).catch(() => {});
-    }
-  }
+  return watchSpoolJob({
+    printerName,
+    listJobs: listJobsMac,
+    submit,
+    onStage,
+    expectName: path.basename(job.tempPath),
+  });
 }
 
 // Windows — SumatraPDF. The dashboard's paperSize enum is uppercase
@@ -638,14 +1117,10 @@ function sumatraBinaryPath() {
     : path.join(__dirname, "vendor", "win", "SumatraPDF.exe");
 }
 
-async function printFileWindows({ tempPath, copies, paperSize, printerName, colorMode, duplex, pageRange }) {
-  const exe = sumatraBinaryPath();
-  if (!existsSync(exe)) {
-    throw new Error(
-      `Print engine not found at ${exe}. Reinstall the companion app to restore it.`
-    );
-  }
-
+function buildSumatraArgs(
+  { tempPath, copies, paperSize, colorMode, duplex, pageRange },
+  printerName
+) {
   // -print-settings takes one comma-separated list
   const settings = [];
   if (copies > 1) settings.push(`${copies}x`);
@@ -661,10 +1136,50 @@ async function printFileWindows({ tempPath, copies, paperSize, printerName, colo
   if (printerName) args.push("-print-to", printerName);
   else args.push("-print-to-default");
   args.push("-print-settings", settings.join(","), "-silent", "-exit-when-done", tempPath);
+  return args;
+}
 
+async function printFileWindows(job, onStage) {
+  const pre = await preflightWindows(job.printerName);
+  if (!pre.ok) throw new PrintFailure(pre.code, pre.message);
+  const printerName = pre.printerName;
+
+  const exe = sumatraBinaryPath();
+  if (!existsSync(exe)) {
+    throw new PrintFailure(
+      "ENGINE_MISSING",
+      `Print engine not found at ${exe}. Reinstall the companion app to restore it.`
+    );
+  }
+
+  const args = buildSumatraArgs(job, printerName);
   console.log("[Companion] SumatraPDF args:", args);
-  await execFileAsync(exe, args, { windowsHide: true });
-  console.log("[Companion] print-file: SumatraPDF succeeded");
+
+  const submit = async () => {
+    try {
+      // timeout + kill: a driver dialog surfacing behind -silent would otherwise
+      // hang this promise for the life of the app, and the job with it.
+      await execFileAsync(exe, args, {
+        windowsHide: true,
+        timeout: SUBMIT_TIMEOUT_MS,
+        killSignal: "SIGKILL",
+      });
+      console.log("[Companion] print-file: SumatraPDF accepted the job");
+    } catch (err) {
+      if (err.killed) {
+        throw new PrintFailure("ENGINE_TIMEOUT", "The print engine stopped responding.");
+      }
+      throw new PrintFailure("ENGINE_FAILED", err.message);
+    }
+  };
+
+  return watchSpoolJob({
+    printerName,
+    listJobs: listJobsWindows,
+    submit,
+    onStage,
+    expectName: path.basename(job.tempPath),
+  });
 }
 
 ipcMain.handle("print-file", async (event, options = {}) => {
@@ -686,21 +1201,49 @@ ipcMain.handle("print-file", async (event, options = {}) => {
   const tempPath = path.join(tmpdir(), `print-${Date.now()}-${safeName}`);
   await writeFile(tempPath, buffer);
 
-  if (mainWindow) mainWindow.webContents.send("print-stage", "printing");
-
   const job = { tempPath, copies, paperSize, printerName, colorMode, duplex, pageRange };
 
-  try {
-    if (IS_WINDOWS) await printFileWindows(job);
-    else await printFileMac(job);
+  const onStage = (info) => {
+    if (!mainWindow || mainWindow.isDestroyed()) return;
+    // 'print-stage' is the legacy string channel the dashboard already listens
+    // on. 'blocked' has no PrintStage equivalent, so it rides the richer
+    // 'print-progress' channel only.
+    if (info.stage !== "blocked") mainWindow.webContents.send("print-stage", info.stage);
+    mainWindow.webContents.send("print-progress", info);
+  };
 
-    if (mainWindow) mainWindow.webContents.send("print-stage", "complete");
-    return { success: true, stage: "complete" };
+  onStage({ stage: "preparing" });
+
+  // Stands the status poll down so its PowerShell probes do not queue ahead of
+  // the watchdog's.
+  _printsInFlight++;
+
+  try {
+    const result = IS_WINDOWS
+      ? await printFileWindows(job, onStage)
+      : await printFileMac(job, onStage);
+
+    onStage({ stage: "complete", confirmed: result.confirmed });
+    console.log("[Companion] print-file done, confirmed:", result.confirmed);
+    return result;
   } catch (error) {
     console.error("[Companion] print-file error:", error);
-    if (mainWindow) mainWindow.webContents.send("print-stage", "error");
-    return { success: false, stage: "error", error: error.message };
+    onStage({ stage: "error", code: error.code, message: error.message });
+    return {
+      success: false,
+      stage: "error",
+      // A PrintFailure is a state we read out of the spooler; anything else is
+      // an unexpected throw we cannot vouch for.
+      confirmed: error instanceof PrintFailure,
+      code: error.code || "UNKNOWN",
+      error: error.message,
+    };
   } finally {
+    _printsInFlight--;
+    // The printer's state is very likely different now — and the backend gates
+    // the next customer's upload on it — so push a fresh reading rather than
+    // waiting up to 30s for the poll to notice.
+    void refreshRealStatus({ force: true }).catch(() => {});
     setTimeout(() => unlink(tempPath).catch(() => {}), 5000);
   }
 });
@@ -719,35 +1262,41 @@ function parsePsDate(value) {
   return new Date().toISOString();
 }
 
-async function getPrintQueueWindows() {
-  if (!mainWindow) return [];
+async function getPrintQueueWindows(printerName) {
   try {
-    const printers = await mainWindow.webContents.getPrintersAsync();
-    const def = printers.find((p) => p.isDefault) || printers[0] || null;
-    if (!def) return [];
+    // Defaults to the default printer, but takes a name so callers reading the
+    // queue for a job print to the same printer that job was sent to.
+    const name = printerName || (await resolveDefaultPrinterName());
+    if (!name) return [];
 
     const out = await runPowerShell(
-      `Get-PrintJob -PrinterName '${escapePs(def.name)}' | Select-Object Id, DocumentName, SubmittedTime | ConvertTo-Json -Compress`
+      `@(Get-PrintJob -PrinterName '${escapePs(name)}' -ErrorAction SilentlyContinue | ` +
+        "Select-Object Id, DocumentName, SubmittedTime, " +
+        "@{n='Status';e={[string]$_.JobStatus}}) | ConvertTo-Json -Compress -Depth 3"
     );
     if (!out) return [];
 
     const parsed = JSON.parse(out);
     const jobs = Array.isArray(parsed) ? parsed : [parsed];
 
-    return jobs.filter(Boolean).map((j) => ({
-      id: String(j.Id),
-      fileName: j.DocumentName || "Untitled",
-      status: "pending",
-      createdAt: parsePsDate(j.SubmittedTime),
-    }));
+    return jobs.filter(Boolean).map((j) => {
+      const verdict = classifyJobStatus(j.Status);
+      return {
+        id: String(j.Id),
+        fileName: j.DocumentName || "Untitled",
+        status: verdict.blocked || verdict.fatal ? "blocked" : "pending",
+        reason: (verdict.blocked || verdict.fatal || {}).message,
+        createdAt: parsePsDate(j.SubmittedTime),
+      };
+    });
   } catch {
     // No spooler access, no jobs, or unparseable output — treat as empty queue
     return [];
   }
 }
 
-ipcMain.handle("get-print-queue", async () => {
-  if (IS_WINDOWS) return getPrintQueueWindows();
+ipcMain.handle("get-print-queue", async (event, printerName) => {
+  if (IS_WINDOWS) return getPrintQueueWindows(printerName);
   // macOS: no CUPS dependency — companion doesn't track the OS spooler.
   return [];
 });

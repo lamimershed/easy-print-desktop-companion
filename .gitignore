@@ -4,7 +4,11 @@ node_modules/
 # Build outputs
 dist/
 out/
-build/
+
+# NOT build/ — that is electron-builder's resources directory, not an output.
+# Ignoring it left build/icon.ico untracked while package.json pointed the
+# Windows target at it, so a clean clone could not produce an installer with
+# the right icon.
 
 # Electron
 .electron/
