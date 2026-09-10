@@ -499,8 +499,35 @@ async function getSupplyLevels(printer) {
 
 // ── Cross-platform printer status ─────────────────────────────────────────────
 
-// Electron's printer.status codes: 0=Idle, 1=Processing, 2=Paused, 3=Stopped, 4=Error
-const ELECTRON_STATUS_MAP = { 0: "ready", 1: "printing", 2: "queue_stopped", 3: "queue_stopped", 4: "unknown" };
+/**
+ * `printer.status` is not one enum across platforms.
+ *
+ * On macOS it is the CUPS/IPP `printer-state` (RFC 8011): 3 idle, 4 processing,
+ * 5 stopped. This table used to hold the *Windows* enum — 0 Idle, 1 Processing,
+ * 2 Paused, 3 Stopped — and applied it to the CUPS value, so an idle Mac
+ * printer, state 3, read as a stopped queue. The backend gates customer uploads
+ * on this status, so a perfectly healthy shop advertised itself as paused and
+ * turned away every job, with nothing anywhere to un-pause. Windows never used
+ * this table: `getWindowsPrinterStatus` reads PowerShell strings instead.
+ */
+const IPP_PRINTER_STATE = { 3: "ready", 4: "printing", 5: "queue_stopped" };
+
+/**
+ * A CUPS queue can be disabled while its state still reads idle, and
+ * `printer-state-reasons` is the only place that says so.
+ *
+ * Vendor reasons are namespaced with dots (`com.canon.ijprinter-…`) and carry no
+ * standard meaning — a Canon reports nineteen of them, including strings like
+ * `auto-power-off-off`. Only the un-namespaced IPP keywords are read.
+ */
+const STOPPED_STATE_REASON = /^(paused|moving-to-paused|shutdown|offline-report)/;
+
+function standardStateReasons(printer) {
+  return String(printer.options?.["printer-state-reasons"] ?? "")
+    .split(",")
+    .map((r) => r.trim())
+    .filter((r) => r && !r.includes("."));
+}
 
 async function getMacPrinterStatus(printer) {
   const deviceUri = printer.options?.["device-uri"] ?? "";
@@ -513,7 +540,12 @@ async function getMacPrinterStatus(printer) {
       return "unknown";
     }
   }
-  return ELECTRON_STATUS_MAP[printer.status] ?? "unknown";
+
+  if (standardStateReasons(printer).some((r) => STOPPED_STATE_REASON.test(r))) {
+    return "queue_stopped";
+  }
+
+  return IPP_PRINTER_STATE[printer.status] ?? "unknown";
 }
 
 /**
