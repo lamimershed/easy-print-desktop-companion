@@ -1,6 +1,6 @@
 {
   "name": "cafe-app",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "Simple Electron print app",
   "main": "main.js",
   "scripts": {
@@ -54,7 +54,8 @@
         "from": "vendor/win",
         "to": "vendor/win",
         "filter": [
-          "**/*"
+          "**/*",
+          "!SumatraPDF-settings.txt"
         ]
       }
     ]
