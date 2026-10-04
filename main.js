@@ -11,7 +11,7 @@ require("dotenv").config({
 const path = require("path");
 const { existsSync } = require("fs");
 const { writeFile, unlink } = require("fs/promises");
-const { exec, execFile } = require("child_process");
+const { exec, execFile, spawn } = require("child_process");
 const { promisify } = require("util");
 const { tmpdir } = require("os");
 
@@ -192,6 +192,8 @@ if (!gotSingleInstanceLock) {
 
   app.whenReady().then(() => {
     createWindow();
+    // Pay the PowerShell worker's start-up (~1–2s) now, not on the first print.
+    if (IS_WINDOWS) runPowerShell("$null").catch(() => {});
     startPrinterStatusPolling();
     watchPowerEvents();
     app.on("activate", () => {
@@ -217,6 +219,8 @@ function watchPowerEvents() {
   powerMonitor.on("resume", () => reprobe("system resumed"));
   powerMonitor.on("unlock-screen", () => reprobe("screen unlocked"));
 }
+
+app.on("will-quit", stopPsWorker);
 
 app.on("window-all-closed", () => {
   stopPrinterStatusPolling();
@@ -260,39 +264,160 @@ function escapePs(value) {
  * on "Printing…" forever, and only the reconciler's refund ends it.
  */
 const PS_TIMEOUT_MS = 8000;
+/** Ceiling for a cold powershell.exe to load PrintManagement and say it is ready. */
+const PS_START_TIMEOUT_MS = 20_000;
+
+/**
+ * Probes run in one long-lived powershell.exe rather than a launch per probe.
+ *
+ * A fresh launch costs 1.5–5s on a shop PC (process start, then PrintManagement
+ * loading over WMI) and a print used to make a dozen of them in a row before
+ * SumatraPDF even started — ~20s of "Preparing…". Warm, the same probes take
+ * 1–400ms.
+ *
+ * The worker reads one base64 script per stdin line and answers with one
+ * `__PSW__ <ok> <base64 output>` line, so no output can be mistaken for the
+ * delimiter. Any error record — including one hidden by
+ * `-ErrorAction SilentlyContinue` — fails the probe: `listJobsWindows` relies on
+ * that to report an unreadable spooler as `null` rather than an empty queue.
+ */
+const PS_WORKER_SCRIPT = `
+$ProgressPreference = 'SilentlyContinue'
+Import-Module PrintManagement -ErrorAction SilentlyContinue
+$utf8 = New-Object System.Text.UTF8Encoding $false
+[Console]::Out.WriteLine('__PSW_READY__')
+[Console]::Out.Flush()
+while ($null -ne ($line = [Console]::In.ReadLine())) {
+  $ok = 1
+  try {
+    $code = $utf8.GetString([Convert]::FromBase64String($line))
+    $Error.Clear()
+    $res = @(& ([ScriptBlock]::Create($code)) 2>&1)
+    $errs = @($res | Where-Object { $_ -is [System.Management.Automation.ErrorRecord] })
+    if ($errs.Count -gt 0) { $ok = 0; $out = [string]$errs[0] }
+    elseif ($Error.Count -gt 0) { $ok = 0; $out = [string]$Error[0] }
+    else {
+      $out = ($res | ForEach-Object {
+        if ($_ -is [string]) { $_ } else { ($_ | Out-String -Width 4096).TrimEnd() }
+      }) -join [Environment]::NewLine
+    }
+  } catch { $ok = 0; $out = [string]$_ }
+  [Console]::Out.WriteLine('__PSW__ ' + $ok + ' ' + [Convert]::ToBase64String($utf8.GetBytes([string]$out)))
+  [Console]::Out.Flush()
+}
+`;
+
+let _psWorker = null;
+
+function startPsWorker() {
+  const child = spawn(
+    "powershell",
+    [
+      "-NoProfile",
+      "-NonInteractive",
+      "-NoLogo",
+      "-EncodedCommand",
+      Buffer.from(PS_WORKER_SCRIPT, "utf16le").toString("base64"),
+    ],
+    { windowsHide: true, stdio: ["pipe", "pipe", "pipe"] }
+  );
+  const worker = { child, buf: "", pending: null };
+  let markReady, failReady;
+  worker.ready = new Promise((resolve, reject) => {
+    markReady = resolve;
+    failReady = reject;
+  });
+  worker.ready.catch(() => {});
+
+  child.stdout.setEncoding("utf8");
+  child.stdout.on("data", (chunk) => {
+    worker.buf += chunk;
+    let nl;
+    while ((nl = worker.buf.indexOf("\n")) !== -1) {
+      const line = worker.buf.slice(0, nl).trim();
+      worker.buf = worker.buf.slice(nl + 1);
+      if (line === "__PSW_READY__") {
+        markReady();
+        continue;
+      }
+      // Empty output leaves no payload after the trim — an empty queue looks
+      // exactly like that, so the payload group must be optional.
+      const m = /^__PSW__ ([01])(?: (\S+))?$/.exec(line);
+      if (!m || !worker.pending) continue;
+      const { resolve, reject } = worker.pending;
+      worker.pending = null;
+      const text = Buffer.from(m[2] || "", "base64").toString("utf8").trim();
+      if (m[1] === "1") resolve(text);
+      else reject(new Error(text || "PowerShell probe failed"));
+    }
+  });
+  // Drained so a chatty stderr can never fill the pipe and stall the worker.
+  child.stderr.resume();
+  child.stdin.on("error", () => {});
+
+  const die = (err) => {
+    failReady(err);
+    if (_psWorker === worker) _psWorker = null;
+    if (worker.pending) {
+      worker.pending.reject(err);
+      worker.pending = null;
+    }
+  };
+  child.on("exit", (code) => die(new Error(`PowerShell worker exited (${code})`)));
+  child.on("error", die);
+  return worker;
+}
+
+function stopPsWorker() {
+  if (!_psWorker) return;
+  _psWorker.child.kill("SIGKILL");
+  _psWorker = null;
+}
 
 /**
  * PowerShell probes run one at a time.
  *
- * Each one costs a powershell.exe launch — a few hundred milliseconds on a shop
- * PC — and the spool watchdog polls every 1.5s while the printer-status poll
- * runs every 5s. Unserialised those overlap, and on exactly the machine where it
- * matters (a printer that has gone offline, so every call is slow) they pile up
- * processes faster than they retire. The queue holds it to one; the timeout
- * stops a wedged call from holding the queue.
+ * The spool watchdog polls every 1.5s while the printer-status poll runs every
+ * 5s, and the worker answers one script at a time. The queue holds it to one;
+ * the timeout kills a wedged worker (the next probe starts a fresh one) so a
+ * hung `Get-Printer` cannot hold the queue.
  */
 let _psQueue = Promise.resolve();
 
 function runPowerShell(script) {
   const run = async () => {
-    try {
-      const { stdout } = await execFileAsync(
-        "powershell",
-        ["-NoProfile", "-NonInteractive", "-Command", script],
-        {
-          windowsHide: true,
-          timeout: PS_TIMEOUT_MS,
-          killSignal: "SIGKILL",
-          maxBuffer: 4 * 1024 * 1024,
-        }
-      );
-      return stdout.trim();
-    } catch (err) {
-      if (err.killed) {
-        throw new Error(`PowerShell probe timed out after ${PS_TIMEOUT_MS}ms`);
-      }
-      throw err;
+    if (!_psWorker) _psWorker = startPsWorker();
+    const worker = _psWorker;
+
+    // Start-up is timed on its own: a cold powershell.exe plus PrintManagement
+    // can take several seconds on a shop PC, and that should not eat the
+    // per-probe ceiling meant for a wedged Get-Printer.
+    const started = await withTimeout(worker.ready.then(() => true), PS_START_TIMEOUT_MS, false);
+    if (!started) {
+      if (_psWorker === worker) _psWorker = null;
+      worker.child.kill("SIGKILL");
+      throw new Error(`PowerShell worker did not start within ${PS_START_TIMEOUT_MS}ms`);
     }
+
+    return new Promise((resolve, reject) => {
+      const timer = setTimeout(() => {
+        worker.pending = null;
+        if (_psWorker === worker) _psWorker = null;
+        worker.child.kill("SIGKILL");
+        reject(new Error(`PowerShell probe timed out after ${PS_TIMEOUT_MS}ms`));
+      }, PS_TIMEOUT_MS);
+      worker.pending = {
+        resolve: (v) => {
+          clearTimeout(timer);
+          resolve(v);
+        },
+        reject: (e) => {
+          clearTimeout(timer);
+          reject(e);
+        },
+      };
+      worker.child.stdin.write(Buffer.from(script, "utf8").toString("base64") + "\n");
+    });
   };
 
   // `then(run, run)` so one failed probe does not stall every probe behind it.
@@ -620,27 +745,40 @@ async function detectDuplexSupportMac(printerName) {
   return false;
 }
 
+// A driver's duplex capability does not change while the app runs, and the
+// Get-PrinterProperty fallback fails slowly on drivers that lack the property
+// (every call, on a Canon MG2500). Only answers we actually read are cached.
+const _duplexSupportCache = new Map();
+
 async function detectDuplexSupportWindows(printerName) {
   if (!printerName) return false;
+  if (_duplexSupportCache.has(printerName)) return _duplexSupportCache.get(printerName);
   const name = escapePs(printerName);
+  let answered = false;
+  let supported = false;
 
   // Win32_Printer.Capabilities contains 3 when the driver advertises duplex.
   try {
     const out = await runPowerShell(
       `Get-CimInstance Win32_Printer | Where-Object { $_.Name -eq '${name}' } | Select-Object -ExpandProperty Capabilities`
     );
-    if (out.split(/\r?\n/).some((l) => l.trim() === "3")) return true;
+    answered = true;
+    supported = out.split(/\r?\n/).some((l) => l.trim() === "3");
   } catch { /* WMI unavailable */ }
 
   // Fallback: the driver's own duplex-unit config property
-  try {
-    const out = await runPowerShell(
-      `Get-PrinterProperty -PrinterName '${name}' -PropertyName 'Config:DuplexUnit' | Select-Object -ExpandProperty Value`
-    );
-    return out.trim().toLowerCase() === "installed";
-  } catch { /* property not exposed by this driver */ }
+  if (!supported) {
+    try {
+      const out = await runPowerShell(
+        `Get-PrinterProperty -PrinterName '${name}' -PropertyName 'Config:DuplexUnit' | Select-Object -ExpandProperty Value`
+      );
+      answered = true;
+      supported = out.trim().toLowerCase() === "installed";
+    } catch { /* property not exposed by this driver */ }
+  }
 
-  return false;
+  if (answered) _duplexSupportCache.set(printerName, supported);
+  return supported;
 }
 
 async function detectDuplexSupport(printerName) {
@@ -731,6 +869,8 @@ ipcMain.handle("print-hello", async () => {
 // turn "submitted" into an outcome we actually observed.
 
 const POLL_MS = 1500;
+/** First look after submitting — soon enough that "printing" is not a beat late. */
+const FIRST_POLL_MS = 400;
 /** Longest we wait for a submitted job to surface in the spooler. */
 const SUBMIT_TIMEOUT_MS = 60_000;
 /** No page progress for this long, job still queued → the printer gave up. */
@@ -975,9 +1115,11 @@ async function watchSpoolJob({ printerName, listJobs, submit, onStage, expectNam
   let blockedCode = null;
   let readFailures = 0;
   const appearBy = Date.now() + SUBMIT_TIMEOUT_MS;
+  let pollMs = FIRST_POLL_MS;
 
   for (;;) {
-    await new Promise((r) => setTimeout(r, POLL_MS));
+    await new Promise((r) => setTimeout(r, pollMs));
+    pollMs = POLL_MS;
     if (submitError) throw submitError;
 
     const jobs = await listJobs(printerName).catch(() => null);

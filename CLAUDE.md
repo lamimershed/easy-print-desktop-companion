@@ -80,9 +80,18 @@ idle timeout to notice.
 
 ## Windows specifics
 
-**Every Windows probe is a PowerShell launch, so they are serialised and
-timed out.** `runPowerShell` runs one script at a time behind a promise chain
-with an 8s per-call ceiling. Both parts are load-bearing: `Get-Printer` against
+**Every Windows probe runs in one long-lived PowerShell worker, serialised and
+timed out.** A fresh `powershell.exe` per probe cost 1.5–5s (start-up plus
+loading PrintManagement over WMI), and a print made a dozen in a row before
+SumatraPDF started. The worker (`startPsWorker`) is started at launch and takes
+one base64 script per stdin line, answering `__PSW__ <ok> <base64>`. Any error
+record — even one hidden by `-ErrorAction SilentlyContinue` — fails the probe,
+which is what keeps an unreadable spooler `null` rather than an empty queue.
+Empty output is a valid answer (an empty queue is exactly that).
+`runPowerShell` runs one script at a time behind a promise chain with an 8s
+per-call ceiling; a timed-out probe kills the worker and the next probe starts
+a fresh one. Start-up has its own 20s ceiling so a cold machine does not eat a
+probe's budget. Both parts are load-bearing: `Get-Printer` against
 a printer that dropped off the network genuinely never returns on some
 driver/port combinations, and one of those inside the watchdog's 1.5s poll loop
 hangs the loop for the life of the app. Unserialised, the watchdog and the
