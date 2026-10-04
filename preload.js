@@ -5,6 +5,7 @@ const { contextBridge, ipcRenderer } = require("electron");
 // removed nothing and leaked a listener on every print job.
 const stageWrappers = new WeakMap();
 const progressWrappers = new WeakMap();
+const snapshotWrappers = new WeakMap();
 
 function subscribe(registry, channel, cb) {
   if (typeof cb !== "function" || registry.has(cb)) return;
@@ -70,6 +71,15 @@ contextBridge.exposeInMainWorld("electronAPI", {
   // Unsubscribe all printer-status-change listeners (safe — only usePrinterFeedback subscribes)
   offPrinterStatusChange: (_cb) =>
     ipcRenderer.removeAllListeners("printer-status-change"),
+
+  // The monitor's last reading of the default printer — status, alerts,
+  // connection, queue, driver, capabilities, defaults, supplies — answered from
+  // memory. `{ force: true }` re-reads first (and refreshes cached details).
+  getPrinterSnapshot: (options) => ipcRenderer.invoke("get-printer-snapshot", options),
+
+  // Pushed after every monitor read (~10s, sooner when something changes).
+  onPrinterSnapshot: (cb) => subscribe(snapshotWrappers, "printer-snapshot", cb),
+  offPrinterSnapshot: (cb) => unsubscribe(snapshotWrappers, "printer-snapshot", cb),
 
   // Resolve the physical printer state on demand: 'ready' | 'printing' |
   // 'queue_stopped' | 'disconnected' | 'unknown'. Cheaper than getDeviceInfo.

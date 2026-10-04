@@ -36,3 +36,6 @@ Thumbs.db
 # Agent/tooling scratch dirs
 .playwright-mcp/
 .superpowers/
+
+# Written by SumatraPDF each time it runs; must not ship in the installer
+vendor/win/SumatraPDF-settings.txt

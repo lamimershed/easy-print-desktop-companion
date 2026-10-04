@@ -87,87 +87,171 @@ function createWindow() {
   });
 }
 
-// ── Printer status polling ────────────────────────────────────────────────────
+// ── Printer monitor ───────────────────────────────────────────────────────────
+//
+// One reading of the default printer, owned here and pushed to the dashboard.
+//
+// The dashboard used to ask for device info from every component on every
+// mount, so each navigation started from "No Printer Found" until a full probe
+// answered, and one slow or failed probe was enough to flip the card. Now this
+// process keeps the last snapshot, re-reads it on a timer, and only believes a
+// printer got worse (gone, offline, unknown) once a second read agrees.
+// Renderers get the cached snapshot instantly (`get-printer-snapshot`) and a
+// `printer-snapshot` event after every read.
+//
+// Every field is optional by design: drivers report wildly different things,
+// and the card shows only what this printer actually told us.
 
-// The numeric poll is cheap (an Electron call). Resolving realStatus is not —
-// on Windows it shells out to PowerShell — so it runs only when the numeric
-// status moved or REAL_STATUS_MAX_AGE_MS has passed since the last resolve.
-const REAL_STATUS_MAX_AGE_MS = 30_000;
+const MONITOR_INTERVAL_MS = 10_000;
+/** Pause before re-reading a printer that just looked worse, to confirm it. */
+const MONITOR_CONFIRM_MS = 2_000;
+/** Driver, capabilities and defaults barely change; re-read them this often. */
+const MONITOR_DETAILS_MAX_AGE_MS = 5 * 60_000;
+/** SNMP supply levels (network printers only) are re-read this often. */
+const MONITOR_SUPPLIES_MAX_AGE_MS = 60_000;
+/** Failed reads in a row before the printer is reported as unknown. */
+const MONITOR_MAX_FAILURES = 3;
 
-let _lastPrinterStatus = null;
+const HEALTHY_STATUSES = new Set(["ready", "printing"]);
+
+let _snapshot = null;
+let _monitorTimer = null;
+let _monitorRun = null;
+let _probeFailures = 0;
+let _lastNumericStatus = null;
 let _lastRealStatus = null;
-let _lastRealStatusAt = 0;
-let _printerPollTimer = null;
-
-/** Resolves realStatus for the default printer. Returns 'disconnected' when there is none. */
-async function resolveDefaultPrinterRealStatus() {
-  if (!mainWindow || mainWindow.isDestroyed()) return _lastRealStatus;
-  const printers = await mainWindow.webContents.getPrintersAsync();
-  const def = printers.find((p) => p.isDefault) || printers[0] || null;
-  if (!def) return "disconnected";
-  return getPrinterRealStatus(def);
-}
-
-/**
- * Pushes realStatus to the renderer whenever it changes, so the dashboard can
- * forward it to the backend without polling the expensive get-device-info path
- * on every page.
- */
-async function refreshRealStatus({ force = false } = {}) {
-  const real = await resolveDefaultPrinterRealStatus();
-  _lastRealStatusAt = Date.now();
-  if (real !== _lastRealStatus || force) {
-    _lastRealStatus = real;
-    if (mainWindow && !mainWindow.isDestroyed()) {
-      mainWindow.webContents.send("printer-real-status", real);
-    }
-  }
-  return real;
-}
+const _detailsCache = new Map(); // printer name → { at, details }
+const _suppliesCache = new Map(); // printer name → { at, supplies }
 
 /**
  * Non-zero while a print is being watched.
  *
  * The spool watchdog polls PowerShell every 1.5s and every probe here is
- * serialised behind it, so a status poll running alongside a print only adds
+ * serialised behind it, so a status read running alongside a print only adds
  * latency to the poll that actually matters — and the watchdog reports printer
- * trouble in far more detail anyway. The status poll stands down until the job
- * is done.
+ * trouble in far more detail anyway. Timed reads stand down until the job is
+ * done; an explicit refresh still runs.
  */
 let _printsInFlight = 0;
 
-function startPrinterStatusPolling() {
-  const poll = async () => {
-    if (!mainWindow || mainWindow.isDestroyed()) return;
-    if (_printsInFlight > 0) {
-      _printerPollTimer = setTimeout(poll, 5000);
-      return;
-    }
-    try {
-      const printers = await mainWindow.webContents.getPrintersAsync();
-      const def = printers.find((p) => p.isDefault) || printers[0] || null;
-      const status = def ? def.status : -1;
-      const numericChanged = status !== _lastPrinterStatus;
-      if (numericChanged) {
-        _lastPrinterStatus = status;
-        mainWindow.webContents.send("printer-status-change", status);
-      }
-      if (numericChanged || Date.now() - _lastRealStatusAt >= REAL_STATUS_MAX_AGE_MS) {
-        await refreshRealStatus();
-      }
-    } catch {
-      // Window may be closing — ignore
-    }
-    _printerPollTimer = setTimeout(poll, 5000);
-  };
-  _printerPollTimer = setTimeout(poll, 5000);
+function sendToRenderer(channel, payload) {
+  if (mainWindow && !mainWindow.isDestroyed()) mainWindow.webContents.send(channel, payload);
 }
 
-function stopPrinterStatusPolling() {
-  if (_printerPollTimer) {
-    clearTimeout(_printerPollTimer);
-    _printerPollTimer = null;
+function realStatusOf(snapshot) {
+  return snapshot?.printer ? snapshot.printer.status : "disconnected";
+}
+
+/** Worse = the printer vanished, or a healthy printer stopped being healthy. */
+function isWorseReading(prev, next) {
+  if (!prev?.printer) return false;
+  if (!next.printer) return true;
+  if (prev.printer.name !== next.printer.name) return false;
+  return HEALTHY_STATUSES.has(prev.printer.status) && !HEALTHY_STATUSES.has(next.printer.status);
+}
+
+async function readPrinters({ force }) {
+  const all = await mainWindow.webContents.getPrintersAsync();
+  const printers = all.map((p) => ({
+    name: p.name,
+    displayName: p.displayName || p.name,
+    isDefault: !!p.isDefault,
+  }));
+  const def = all.find((p) => p.isDefault) || all[0] || null;
+
+  if (def && def.status !== _lastNumericStatus) {
+    _lastNumericStatus = def.status;
+    // Older dashboards refetch on this; current ones listen for printer-snapshot.
+    sendToRenderer("printer-status-change", def.status);
   }
+
+  const printer = !def
+    ? null
+    : IS_WINDOWS
+      ? await readWindowsPrinter(def, { force })
+      : await readMacPrinter(def, { force });
+
+  return { printers, printer, error: null, updatedAt: Date.now() };
+}
+
+async function runMonitorTick(force) {
+  if (!mainWindow || mainWindow.isDestroyed()) return _snapshot;
+
+  let next;
+  try {
+    next = await readPrinters({ force });
+    if (isWorseReading(_snapshot, next)) {
+      // One bad read is not news — a busy spooler or a slow driver produces
+      // those. Look again before telling the shop (and the backend) anything.
+      await new Promise((r) => setTimeout(r, MONITOR_CONFIRM_MS));
+      next = await readPrinters({ force });
+    }
+    _probeFailures = 0;
+  } catch (err) {
+    _probeFailures++;
+    const message = err?.message || String(err);
+    console.warn(`[Companion] printer read failed (${_probeFailures}x):`, message);
+    if (_snapshot && _probeFailures < MONITOR_MAX_FAILURES) {
+      // Keep showing what we last knew, flagged as stale, rather than a blank.
+      next = { ..._snapshot, error: message, stale: true, updatedAt: Date.now() };
+    } else {
+      next = {
+        printers: _snapshot?.printers ?? [],
+        printer: _snapshot?.printer ? { ..._snapshot.printer, status: "unknown" } : null,
+        error: message,
+        stale: true,
+        updatedAt: Date.now(),
+      };
+    }
+  }
+
+  _snapshot = next;
+  sendToRenderer("printer-snapshot", next);
+
+  // The backend gates customer uploads on this, so it is pushed on change — and
+  // on every forced read, which follows a print or the machine waking up.
+  const real = realStatusOf(next);
+  if (real !== _lastRealStatus || force) {
+    _lastRealStatus = real;
+    sendToRenderer("printer-real-status", real);
+  }
+  return next;
+}
+
+/** One read at a time; concurrent callers share it. A forced read queues behind. */
+async function monitorTick({ force = false } = {}) {
+  if (_monitorRun) {
+    if (!force) return _monitorRun;
+    await _monitorRun.catch(() => {});
+    if (_monitorRun) return monitorTick({ force });
+  }
+  _monitorRun = runMonitorTick(force).finally(() => {
+    _monitorRun = null;
+  });
+  return _monitorRun;
+}
+
+/** Kept for the call sites that only need the status (print end, wake-up). */
+async function refreshRealStatus({ force = false } = {}) {
+  return realStatusOf(await monitorTick({ force }));
+}
+
+function scheduleMonitor() {
+  clearTimeout(_monitorTimer);
+  _monitorTimer = setTimeout(async () => {
+    if (_printsInFlight === 0) await monitorTick().catch(() => {});
+    scheduleMonitor();
+  }, MONITOR_INTERVAL_MS);
+}
+
+function startPrinterMonitor() {
+  void monitorTick().catch(() => {});
+  scheduleMonitor();
+}
+
+function stopPrinterMonitor() {
+  clearTimeout(_monitorTimer);
+  _monitorTimer = null;
 }
 
 // One companion per shop PC.
@@ -194,7 +278,7 @@ if (!gotSingleInstanceLock) {
     createWindow();
     // Pay the PowerShell worker's start-up (~1–2s) now, not on the first print.
     if (IS_WINDOWS) runPowerShell("$null").catch(() => {});
-    startPrinterStatusPolling();
+    startPrinterMonitor();
     watchPowerEvents();
     app.on("activate", () => {
       if (BrowserWindow.getAllWindows().length === 0) createWindow();
@@ -206,8 +290,8 @@ if (!gotSingleInstanceLock) {
  * A shop PC sleeps overnight, and the backend gates customer uploads on the
  * last printer status this app reported. Without this the woken machine keeps
  * advertising whatever it saw before it slept — most damagingly "ready" for a
- * printer that has since been switched off — until the 30s status poll happens
- * to come round and notice. Re-probe the moment we are back.
+ * printer that has since been switched off — until the monitor's next read
+ * happens to come round and notice. Re-probe the moment we are back.
  */
 function watchPowerEvents() {
   const reprobe = (why) => {
@@ -223,17 +307,27 @@ function watchPowerEvents() {
 app.on("will-quit", stopPsWorker);
 
 app.on("window-all-closed", () => {
-  stopPrinterStatusPolling();
+  stopPrinterMonitor();
   if (process.platform !== "darwin") app.quit();
 });
 
+// ── IPC: printer snapshot ─────────────────────────────────────────────────────
+// The monitor's last reading, answered from memory. `force` re-reads first
+// (the dashboard's Refresh button) and also refreshes the cached details.
+
+ipcMain.handle("get-printer-snapshot", async (_event, options = {}) => {
+  if (options?.force) return monitorTick({ force: true });
+  return _snapshot ?? monitorTick();
+});
+
 // ── IPC: get-printer-real-status ──────────────────────────────────────────────
-// Cheap targeted probe — skips the supply-level and duplex work in
-// get-device-info. Used by the dashboard to report printer state to the backend.
+// Used by the dashboard to report printer state to the backend. Served from the
+// monitor's snapshot while it is fresh; a stale one is re-read first.
 
 ipcMain.handle("get-printer-real-status", async () => {
   try {
-    return await refreshRealStatus({ force: true });
+    const fresh = _snapshot && Date.now() - _snapshot.updatedAt < 2 * MONITOR_INTERVAL_MS;
+    return realStatusOf(fresh ? _snapshot : await monitorTick());
   } catch {
     return "unknown";
   }
@@ -617,11 +711,6 @@ async function getSupplyLevelsWindows(printer) {
   }
 }
 
-async function getSupplyLevels(printer) {
-  if (IS_WINDOWS) return getSupplyLevelsWindows(printer);
-  return { levels: parseSupplyLevelsMac(printer), error: null };
-}
-
 // ── Cross-platform printer status ─────────────────────────────────────────────
 
 /**
@@ -633,7 +722,7 @@ async function getSupplyLevels(printer) {
  * printer, state 3, read as a stopped queue. The backend gates customer uploads
  * on this status, so a perfectly healthy shop advertised itself as paused and
  * turned away every job, with nothing anywhere to un-pause. Windows never used
- * this table: `getWindowsPrinterStatus` reads PowerShell strings instead.
+ * this table: `windowsRealStatus` reads PowerShell strings instead.
  */
 const IPP_PRINTER_STATE = { 3: "ready", 4: "printing", 5: "queue_stopped" };
 
@@ -702,33 +791,400 @@ async function probeWindowsPrinterPresent(printerName, brandHint) {
   }
 }
 
-async function getWindowsPrinterStatus(printer) {
-  let state = "unknown";
-  try {
-    const s = (
-      await runPowerShell(
-        `Get-Printer -Name '${escapePs(printer.name)}' | Select-Object -ExpandProperty PrinterStatus`
-      )
-    ).toLowerCase();
-    if (s === "normal") state = "ready";
-    else if (s === "printing") state = "printing";
-    else if (s === "offline" || s === "error" || s === "degraded") state = "queue_stopped";
-  } catch {
-    /* PS unavailable */
-  }
+// ── Printer readers ───────────────────────────────────────────────────────────
+// What one monitor read collects for the default printer. Both platforms fill
+// the same shape; anything a driver does not report stays null or empty, and
+// the dashboard leaves it off the card.
 
-  const present = await probeWindowsPrinterPresent(printer.name, printer.displayName);
-  if (present === false) return "disconnected";
+const PAPER_LABELS = {
+  NorthAmericaLetter: "Letter",
+  NorthAmericaLegal: "Legal",
+  NorthAmericaTabloid: "Tabloid",
+  NorthAmericaExecutive: "Executive",
+  NorthAmericaStatement: "Statement",
+  NorthAmericaNumber10Envelope: "#10 envelope",
+  ISODLEnvelope: "DL envelope",
+  ISOC5Envelope: "C5 envelope",
+  OtherMetricA3Plus: "A3+",
+  OtherMetricA4Plus: "A4+",
+  JapanLPhoto: "L photo",
+  Japan2LPhoto: "2L photo",
+  JapanHagakiPostcard: "Postcard",
+  NorthAmericaCSheet: "C sheet",
+  NorthAmericaDSheet: "D sheet",
+  NorthAmericaESheet: "E sheet",
+};
 
-  return state;
+/** PrintTicket media names ("ISOA4", "NorthAmerica4x6") → what a shop calls them. */
+function paperLabel(name) {
+  if (!name) return null;
+  if (PAPER_LABELS[name]) return PAPER_LABELS[name];
+  let m;
+  if ((m = /^ISO([ABC]\d+)$/.exec(name))) return m[1];
+  if ((m = /^JIS(B\d+)$/.exec(name))) return `${m[1]} (JIS)`;
+  if ((m = /^NorthAmerica(\d+)x(\d+)$/.exec(name))) return `${m[1]}×${m[2]} in`;
+  const bare = name
+    .replace(/^(NorthAmerica|ISO|JIS|Japan|OtherMetric|Other|PRC|ROC)/, "")
+    .replace(/([a-z])([A-Z0-9])/g, "$1 $2")
+    .trim();
+  return bare || name;
 }
 
-async function getPrinterRealStatus(printer) {
-  if (IS_WINDOWS) return getWindowsPrinterStatus(printer);
-  return getMacPrinterStatus(printer);
+const COLOR_LABELS = { Color: "Color", Monochrome: "Black & white", Grayscale: "Grayscale" };
+const SIDES_LABELS = {
+  OneSided: "One-sided",
+  TwoSidedLongEdge: "Two-sided (long edge)",
+  TwoSidedShortEdge: "Two-sided (short edge)",
+};
+
+function uniq(values) {
+  return [...new Set(values.filter(Boolean))];
+}
+
+/** DriverVersion packs four 16-bit fields into one 64-bit number. */
+function decodeDriverVersion(raw) {
+  if (!raw) return null;
+  try {
+    const v = BigInt(raw);
+    if (v === 0n) return null;
+    return [48n, 32n, 16n, 0n].map((shift) => Number((v >> shift) & 0xffffn)).join(".");
+  } catch {
+    return String(raw);
+  }
+}
+
+function alertOf(code, message, severity) {
+  return { code, message, severity };
+}
+
+// System.Printing.PrintQueue flags, reported by any driver that implements
+// them. Plenty of drivers (USB inkjets especially) never set most of these.
+const WINDOWS_FLAG_ALERTS = {
+  IsPaperJammed: alertOf("PAPER_JAM", "Paper jam", "error"),
+  IsOutOfPaper: alertOf("PAPER_OUT", "Out of paper", "error"),
+  IsDoorOpened: alertOf("DOOR_OPEN", "A cover or door is open", "error"),
+  IsOutOfMemory: alertOf("OUT_OF_MEMORY", "The printer is out of memory", "error"),
+  IsOffline: alertOf("OFFLINE", "The printer is offline", "error"),
+  IsNotAvailable: alertOf("NOT_AVAILABLE", "The printer is not available", "error"),
+  IsPaused: alertOf("PAUSED", "The print queue is paused", "error"),
+  IsInError: alertOf("PRINTER_ERROR", "The printer is reporting an error", "error"),
+  HasPaperProblem: alertOf("PAPER_PROBLEM", "There is a problem with the paper", "warning"),
+  IsManualFeedRequired: alertOf("MANUAL_FEED", "Waiting for paper to be fed by hand", "warning"),
+  IsTonerLow: alertOf("TONER_LOW", "Ink or toner is low", "warning"),
+  IsOutputBinFull: alertOf("OUTPUT_FULL", "The output tray is full", "warning"),
+  NeedUserIntervention: alertOf("NEEDS_ATTENTION", "The printer needs attention", "warning"),
+  IsWarmingUp: alertOf("WARMING_UP", "Warming up", "info"),
+  IsInitializing: alertOf("INITIALIZING", "Starting up", "info"),
+  IsPowerSaveOn: alertOf("POWER_SAVE", "In power-save mode", "info"),
+};
+
+/**
+ * One PowerShell read of a Windows printer. `withDetails` adds the parts that
+ * barely change (capabilities, defaults, driver, port) — the monitor caches
+ * those and asks for them every few minutes, not every tick.
+ *
+ * Each optional part sits in its own try so one unsupported call (a driver
+ * without PrintTicket support, a port the cmdlet cannot read) costs only that
+ * field. `$Error.Clear()` at the end says those were handled: the worker fails
+ * any probe that leaves an error behind. Get-Printer itself is not optional — a
+ * printer it cannot see fails the read.
+ */
+function windowsPrinterProbeScript(printerName, brand, withDetails) {
+  return `
+$n = '${escapePs(printerName)}'
+$r = [ordered]@{}
+try { $r.spooler = [string](Get-Service -Name Spooler).Status } catch {}
+# -Name takes wildcards, so a name containing [ ] * ? would match the wrong
+# printer or none at all without erroring. Match it exactly instead.
+if ([Management.Automation.WildcardPattern]::ContainsWildcardCharacters($n)) {
+  $p = Get-Printer -ErrorAction Stop | Where-Object { $_.Name -eq $n } | Select-Object -First 1
+} else {
+  $p = Get-Printer -Name $n -ErrorAction Stop
+}
+if (-not $p) { throw "Printer '$n' was not found" }
+$r.printerStatus = [string]$p.PrinterStatus
+$r.port = [string]$p.PortName
+$r.type = [string]$p.Type
+$r.shared = [bool]$p.Shared
+$r.workOffline = [bool]$p.WorkOffline
+$r.jobCount = [int]$p.JobCount
+$q = $null
+try {
+  Add-Type -AssemblyName System.Printing
+  $i = $n.LastIndexOf('\\')
+  if ($n.StartsWith('\\\\') -and $i -gt 1) {
+    $q = (New-Object System.Printing.PrintServer($n.Substring(0, $i))).GetPrintQueue($n.Substring($i + 1))
+  } else {
+    $q = (New-Object System.Printing.LocalPrintServer).GetPrintQueue($n)
+  }
+  $flags = @('${Object.keys(WINDOWS_FLAG_ALERTS).join("','")}')
+  $r.flags = @($flags | Where-Object { $q.$_ })
+  $r.location = [string]$q.Location
+  $r.comment = [string]$q.Comment
+} catch {}
+if ($r.port -match '^(USB|DOT4)') {
+  try {
+    $b = [Management.Automation.WildcardPattern]::Escape('${escapePs(brand)}')
+    $st = @(Get-PnpDevice | Where-Object { $_.FriendlyName -like "*$b*" } | ForEach-Object { [string]$_.Status })
+    $r.present = [bool]($st | Where-Object { $_ -eq 'OK' })
+  } catch {}
+}
+if (${withDetails ? "$true" : "$false"}) {
+  if ($q) {
+    try {
+      $c = $q.GetPrintCapabilities()
+      $r.caps = [ordered]@{
+        duplex = @($c.DuplexingCapability | ForEach-Object { [string]$_ })
+        color = @($c.OutputColorCapability | ForEach-Object { [string]$_ })
+        maxCopies = $c.MaxCopyCount
+        media = @($c.PageMediaSizeCapability | ForEach-Object { [string]$_.PageMediaSizeName })
+        orientation = @($c.PageOrientationCapability | ForEach-Object { [string]$_ })
+      }
+    } catch {}
+    try {
+      $t = $q.DefaultPrintTicket
+      $r.defaults = [ordered]@{
+        color = [string]$t.OutputColor
+        duplex = [string]$t.Duplexing
+        media = [string]$t.PageMediaSize.PageMediaSizeName
+        orientation = [string]$t.PageOrientation
+      }
+    } catch {}
+  }
+  try {
+    $d = Get-PrinterDriver -Name $p.DriverName -ErrorAction Stop
+    $r.driver = [ordered]@{ name = [string]$d.Name; manufacturer = [string]$d.Manufacturer; version = [string]$d.DriverVersion }
+  } catch { $r.driver = [ordered]@{ name = [string]$p.DriverName } }
+  try {
+    $pp = Get-PrinterPort -Name $p.PortName -ErrorAction Stop
+    $r.portInfo = [ordered]@{ description = [string]$pp.Description; host = [string]$pp.PrinterHostAddress; monitor = [string]$pp.PortMonitor }
+  } catch {}
+}
+$Error.Clear()
+$r | ConvertTo-Json -Compress -Depth 4
+`;
+}
+
+/** The status the backend gates on — same mapping the companion always used. */
+function windowsRealStatus(r) {
+  if (r.present === false) return "disconnected";
+  const s = String(r.printerStatus || "").toLowerCase();
+  if (s === "normal") return "ready";
+  if (s === "printing") return "printing";
+  if (s === "offline" || s === "error" || s === "degraded") return "queue_stopped";
+  return "unknown";
+}
+
+function windowsDetails(r) {
+  const caps = r.caps;
+  const defaults = r.defaults;
+  return {
+    driver: r.driver?.name
+      ? {
+          name: r.driver.name,
+          manufacturer: r.driver.manufacturer || null,
+          version: decodeDriverVersion(r.driver.version),
+        }
+      : null,
+    capabilities: caps
+      ? {
+          color: caps.color?.length ? caps.color.includes("Color") : null,
+          // The driver's word for it: manual-duplex drivers report two-sided
+          // too, and nothing Windows exposes tells the two apart.
+          twoSided: caps.duplex?.length ? caps.duplex.some((d) => /^TwoSided/.test(d)) : null,
+          maxCopies: Number(caps.maxCopies) > 0 ? Number(caps.maxCopies) : null,
+          paperSizes: uniq((caps.media || []).map(paperLabel)),
+          orientations: uniq(caps.orientation || []),
+        }
+      : null,
+    defaults: defaults
+      ? {
+          color: COLOR_LABELS[defaults.color] || defaults.color || null,
+          sides: SIDES_LABELS[defaults.duplex] || defaults.duplex || null,
+          paperSize: paperLabel(defaults.media),
+          orientation: defaults.orientation || null,
+        }
+      : null,
+    port: r.portInfo
+      ? {
+          description: r.portInfo.description || null,
+          host: r.portInfo.host || null,
+          monitor: r.portInfo.monitor || null,
+        }
+      : null,
+  };
+}
+
+function windowsConnection(printerName, r, port) {
+  const portName = r.port || "";
+  const monitor = port?.monitor || "";
+  let kind = "local";
+  let label = "Local port";
+  if (r.type === "Connection" || printerName.startsWith("\\\\")) {
+    kind = "shared";
+    label = "Shared from another PC";
+  } else if (/^(USB|DOT4)/i.test(portName)) {
+    kind = "usb";
+    label = "USB";
+  } else if (/^WSD/i.test(portName) || /WSD/i.test(monitor)) {
+    kind = "network";
+    label = "Network (WSD)";
+  } else if (port?.host || /TCP/i.test(monitor)) {
+    kind = "network";
+    label = "Network (TCP/IP)";
+  } else if (/^(FILE|nul|PORTPROMPT)/i.test(portName) || /\.(pdf|xps|oxps)$/i.test(portName)) {
+    kind = "virtual";
+    label = "Virtual printer (no hardware)";
+  }
+  return {
+    kind,
+    label,
+    port: portName || null,
+    address: port?.host || null,
+    present: typeof r.present === "boolean" ? r.present : null,
+    sharedOnNetwork: r.shared === true,
+  };
+}
+
+function windowsAlerts(r) {
+  const alerts = [];
+  if (r.spooler && r.spooler.toLowerCase() !== "running") {
+    alerts.push(alertOf("SPOOLER_DOWN", "The Windows Print Spooler service is not running", "error"));
+  }
+  if (r.present === false) {
+    alerts.push(alertOf("DISCONNECTED", "Not connected — check it is switched on and plugged in", "error"));
+  }
+  if (r.workOffline) {
+    alerts.push(alertOf("WORK_OFFLINE", 'Set to "Use Printer Offline" in Windows', "error"));
+  }
+  for (const flag of r.flags || []) {
+    if (WINDOWS_FLAG_ALERTS[flag]) alerts.push(WINDOWS_FLAG_ALERTS[flag]);
+  }
+  return alerts;
+}
+
+async function cachedSupplies(printer, force, read) {
+  const cached = _suppliesCache.get(printer.name);
+  if (!force && cached && Date.now() - cached.at < MONITOR_SUPPLIES_MAX_AGE_MS) return cached.supplies;
+  const supplies = await read();
+  _suppliesCache.set(printer.name, { at: Date.now(), supplies });
+  return supplies;
+}
+
+async function readWindowsPrinter(def, { force }) {
+  const cached = _detailsCache.get(def.name);
+  const withDetails = force || !cached || Date.now() - cached.at > MONITOR_DETAILS_MAX_AGE_MS;
+  const brand = String(def.displayName || def.name).split(" ")[0];
+
+  const r = JSON.parse(await runPowerShell(windowsPrinterProbeScript(def.name, brand, withDetails)));
+
+  let details = cached?.details;
+  if (withDetails) {
+    details = windowsDetails(r);
+    _detailsCache.set(def.name, { at: Date.now(), details });
+  }
+
+  const connection = windowsConnection(def.name, r, details.port);
+  // USB printers expose no supply data on Windows; only network ones answer SNMP.
+  const supplies =
+    connection.kind === "network"
+      ? await cachedSupplies(def, force, () => getSupplyLevelsWindows(def))
+      : { levels: [], error: null };
+
+  return {
+    name: def.name,
+    displayName: def.displayName || def.name,
+    status: windowsRealStatus(r),
+    alerts: windowsAlerts(r),
+    connection,
+    queue: { jobs: Number.isFinite(r.jobCount) ? r.jobCount : null },
+    location: r.location || null,
+    comment: r.comment || null,
+    driver: details.driver,
+    capabilities: details.capabilities,
+    defaults: details.defaults,
+    supplies: supplies.levels,
+    suppliesError: supplies.error,
+  };
+}
+
+// IPP printer-state-reasons keywords (RFC 8011), minus their -error/-warning/
+// -report suffix. Vendor reasons are already filtered out by standardStateReasons.
+const MAC_REASON_ALERTS = {
+  "media-empty": alertOf("PAPER_OUT", "Out of paper", "error"),
+  "media-needed": alertOf("PAPER_OUT", "Out of paper", "error"),
+  "media-jam": alertOf("PAPER_JAM", "Paper jam", "error"),
+  "door-open": alertOf("DOOR_OPEN", "A cover or door is open", "error"),
+  "cover-open": alertOf("DOOR_OPEN", "A cover or door is open", "error"),
+  "toner-empty": alertOf("SUPPLY_EMPTY", "Ink or toner is empty", "error"),
+  "marker-supply-empty": alertOf("SUPPLY_EMPTY", "Ink or toner is empty", "error"),
+  "toner-low": alertOf("TONER_LOW", "Ink or toner is low", "warning"),
+  "marker-supply-low": alertOf("TONER_LOW", "Ink or toner is low", "warning"),
+  "output-area-full": alertOf("OUTPUT_FULL", "The output tray is full", "warning"),
+  "offline": alertOf("OFFLINE", "The printer is offline", "error"),
+  "paused": alertOf("PAUSED", "The print queue is paused", "error"),
+  "shutdown": alertOf("PAUSED", "The print queue is stopped", "error"),
+};
+
+function macConnection(uri, status) {
+  const scheme = (uri.split(":")[0] || "").toLowerCase();
+  let address = null;
+  try {
+    address = /^(ipp|ipps|http|https|socket|lpd)$/.test(scheme) ? new URL(uri).hostname || null : null;
+  } catch {
+    /* not a parseable URI */
+  }
+  if (scheme === "usb") {
+    return { kind: "usb", label: "USB", port: "usb", address: null, present: status !== "disconnected", sharedOnNetwork: false };
+  }
+  if (/^(ipp|ipps|http|https|socket|lpd|dnssd|mdns)$/.test(scheme)) {
+    return { kind: "network", label: `Network (${scheme.toUpperCase()})`, port: scheme, address, present: null, sharedOnNetwork: false };
+  }
+  return { kind: scheme ? "local" : "unknown", label: scheme || "Unknown", port: scheme || null, address: null, present: null, sharedOnNetwork: false };
+}
+
+async function readMacPrinter(def, { force }) {
+  const options = def.options || {};
+  const status = await getMacPrinterStatus(def);
+
+  const cached = _detailsCache.get(def.name);
+  let details = cached?.details;
+  if (force || !cached || Date.now() - cached.at > MONITOR_DETAILS_MAX_AGE_MS) {
+    const model = options["printer-make-and-model"] || null;
+    details = {
+      driver: model ? { name: model, manufacturer: model.split(" ")[0] || null, version: null } : null,
+      capabilities: { twoSided: await detectDuplexSupportMac(def.name) },
+    };
+    _detailsCache.set(def.name, { at: Date.now(), details });
+  }
+
+  const jobs = await listJobsMac(def.name).catch(() => null);
+  const alerts = [];
+  for (const reason of standardStateReasons(def)) {
+    const alert = MAC_REASON_ALERTS[reason.replace(/-(error|warning|report)$/, "")];
+    if (alert && !alerts.some((a) => a.code === alert.code)) alerts.push(alert);
+  }
+
+  return {
+    name: def.name,
+    displayName: def.displayName || def.name,
+    status,
+    alerts,
+    connection: macConnection(options["device-uri"] || "", status),
+    queue: { jobs: Array.isArray(jobs) ? jobs.length : null },
+    location: options["printer-location"] || null,
+    comment: options["printer-info"] && options["printer-info"] !== def.displayName ? options["printer-info"] : null,
+    driver: details.driver,
+    capabilities: details.capabilities,
+    defaults: null,
+    supplies: parseSupplyLevelsMac(def),
+    suppliesError: null,
+  };
 }
 
 // ── IPC: get-device-info ──────────────────────────────────────────────────────
+// The older, per-call shape. Kept for dashboards built before printer-snapshot
+// and for the printer test page; now answered from the monitor's reading.
 
 async function detectDuplexSupportMac(printerName) {
   try {
@@ -745,66 +1201,23 @@ async function detectDuplexSupportMac(printerName) {
   return false;
 }
 
-// A driver's duplex capability does not change while the app runs, and the
-// Get-PrinterProperty fallback fails slowly on drivers that lack the property
-// (every call, on a Canon MG2500). Only answers we actually read are cached.
-const _duplexSupportCache = new Map();
-
-async function detectDuplexSupportWindows(printerName) {
-  if (!printerName) return false;
-  if (_duplexSupportCache.has(printerName)) return _duplexSupportCache.get(printerName);
-  const name = escapePs(printerName);
-  let answered = false;
-  let supported = false;
-
-  // Win32_Printer.Capabilities contains 3 when the driver advertises duplex.
-  try {
-    const out = await runPowerShell(
-      `Get-CimInstance Win32_Printer | Where-Object { $_.Name -eq '${name}' } | Select-Object -ExpandProperty Capabilities`
-    );
-    answered = true;
-    supported = out.split(/\r?\n/).some((l) => l.trim() === "3");
-  } catch { /* WMI unavailable */ }
-
-  // Fallback: the driver's own duplex-unit config property
-  if (!supported) {
-    try {
-      const out = await runPowerShell(
-        `Get-PrinterProperty -PrinterName '${name}' -PropertyName 'Config:DuplexUnit' | Select-Object -ExpandProperty Value`
-      );
-      answered = true;
-      supported = out.trim().toLowerCase() === "installed";
-    } catch { /* property not exposed by this driver */ }
-  }
-
-  if (answered) _duplexSupportCache.set(printerName, supported);
-  return supported;
-}
-
-async function detectDuplexSupport(printerName) {
-  if (IS_WINDOWS) return detectDuplexSupportWindows(printerName);
-  return detectDuplexSupportMac(printerName);
-}
-
 ipcMain.handle("get-device-info", async () => {
-  if (!mainWindow) return { printer: null, supplyLevels: [], cupsError: null, supportsDuplex: false };
+  const empty = { printer: null, supplyLevels: [], cupsError: null, supportsDuplex: false };
+  if (!mainWindow) return empty;
 
   const printers = await mainWindow.webContents.getPrintersAsync();
   const defaultPrinter = printers.find((p) => p.isDefault) || printers[0] || null;
+  if (!defaultPrinter) return empty;
 
-  if (!defaultPrinter) return { printer: null, supplyLevels: [], cupsError: null, supportsDuplex: false };
-
-  const [realStatus, supplies, supportsDuplex] = await Promise.all([
-    getPrinterRealStatus(defaultPrinter),
-    getSupplyLevels(defaultPrinter),
-    detectDuplexSupport(defaultPrinter.name),
-  ]);
+  const snapshot =
+    _snapshot?.printer?.name === defaultPrinter.name ? _snapshot : await monitorTick();
+  const p = snapshot?.printer?.name === defaultPrinter.name ? snapshot.printer : null;
 
   return {
-    printer: { ...defaultPrinter, realStatus },
-    supplyLevels: supplies.levels,
-    cupsError: supplies.error,
-    supportsDuplex,
+    printer: { ...defaultPrinter, realStatus: p?.status ?? "unknown" },
+    supplyLevels: p?.supplies ?? [],
+    cupsError: p?.suppliesError ?? null,
+    supportsDuplex: p?.capabilities?.twoSided === true,
   };
 });
 

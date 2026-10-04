@@ -99,6 +99,20 @@ status poll pile up `powershell.exe` processes faster than they retire on
 exactly the machine where it matters. The status poll also stands down entirely
 while a print is in flight (`_printsInFlight`).
 
+**Printer state comes from one monitor, not from each caller.** The monitor
+(`monitorTick`) reads the default printer every 10s — one PowerShell probe on
+Windows, System.Printing for status flags, capabilities and defaults — and
+pushes a `printer-snapshot` to the renderer; `get-printer-snapshot` answers
+from memory. A reading that is *worse* (printer gone, healthy → not) is
+re-read 2s later and only published if it repeats; recovery publishes at once.
+Failed reads keep the last snapshot (`stale: true`) until the third in a row,
+which reports `unknown`. `printer-real-status` (what the backend gates uploads
+on) is sent on change and on every forced read. Driver, capabilities and
+defaults are cached per printer for 5 minutes. Every field is optional: show
+only what a driver reported. Drivers report manual duplex as two-sided, so
+`twoSided` means "the driver says so", not "has a duplex unit".
+`get-device-info` is kept for older dashboards and is built from the snapshot.
+
 **PowerShell 5.1 vs 7 both have to parse.** `ConvertTo-Json` renders a flag enum
 as an integer and serialises a lone object rather than a one-element array under
 5.1, and dates as `/Date(…)/` rather than ISO-8601 — hence `[string]$_.JobStatus`,
